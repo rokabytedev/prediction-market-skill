@@ -468,3 +468,191 @@ class KalshiDepthTest(unittest.TestCase):
                   "liquidity_usd": None, "open_interest_usd": 900.0,
                   "event_volume_24h_usd": 100.0}
         self.assertTrue(any("open interest" in f for f in pm_query.credibility_flags(market)))
+
+
+# ==========================================================================
+# Regression suite for the defects found by testing the skill on
+# "Will Meta fall further, and how far?" (2026-08-18).
+# ==========================================================================
+
+
+class OutcomeLabelTest(unittest.TestCase):
+    """A price with no label attached can be read backwards.
+
+    "Meta (META) Up or Down on August 19?" carries outcomes ["Up","Down"] and
+    prices ["0.555","0.445"]. Reporting a bare 0.555 on a question phrased
+    "will it fall" invites the exact opposite of the market's view.
+    """
+
+    def test_non_yes_no_binary_says_which_outcome_the_price_is(self):
+        event = load("poly_event_up_down_binary.json")
+        m = pm_query.parse_polymarket_event(event)[0]
+        self.assertEqual(m["probability_of"], "Up")
+        self.assertEqual([o["label"] for o in m["outcome_prices"]], ["Up", "Down"])
+        self.assertAlmostEqual(
+            dict((o["label"], o["p"]) for o in m["outcome_prices"])["Down"],
+            1 - m["probability"], places=3)
+
+    def test_yes_no_market_is_labelled_yes(self):
+        event = load("poly_event_mixed_live_and_resolved.json")
+        for m in pm_query.parse_polymarket_event(event):
+            self.assertEqual(m["probability_of"], "Yes")
+
+    def test_kalshi_and_manifold_are_labelled_too(self):
+        k = pm_query.parse_kalshi_v2_markets(load("kalshi_markets_new_fields.json"))
+        self.assertTrue(all(m["probability_of"] == "Yes" for m in k))
+        mf = pm_query.parse_manifold_search(load("manifold_search.json"))
+        self.assertTrue(all(m["probability_of"] == "Yes" for m in mf))
+
+
+class RelevanceRecallTest(unittest.TestCase):
+    """The gate returned no_live_market for "Meta stock price" while ten live
+    Meta events were trading. Short entity names were the blind spot: `meta`
+    is four letters, so it never counted as distinctive, and generic finance
+    words were doing the matching instead."""
+
+    def market(self, title, outcome="Yes"):
+        return {"source": "polymarket", "id": title, "title": title,
+                "outcome": outcome, "probability": 0.5}
+
+    META = "Meta (META) Up or Down on August 19?"
+    LADDER = "Will Meta (META) close above ___ end of August?"
+    BTC = "BTC price today at 7pm EDT?"
+
+    def test_stock_price_query_finds_the_company_market(self):
+        kept = pm_query.filter_relevant([self.market(self.META)], ["Meta stock price"])
+        self.assertEqual(len(kept), 1)
+
+    def test_bare_company_name_finds_its_markets(self):
+        for title in (self.META, self.LADDER):
+            self.assertEqual(len(pm_query.filter_relevant([self.market(title)], ["Meta"])), 1,
+                             f"bare entity query should match {title!r}")
+
+    def test_generic_finance_words_are_not_evidence(self):
+        """`price` and `above` must not be two of the two required matches."""
+        kept = pm_query.filter_relevant([self.market(self.BTC)],
+                                        ["Meta Platforms stock price"])
+        self.assertEqual(kept, [])
+
+    def test_other_short_entities_work_too(self):
+        cases = [("Tesla (TSLA) Up or Down on August 19?", "Tesla stock price"),
+                 ("Will Apple close above $300?", "Apple share price"),
+                 ("Fed decision in September?", "Fed decision")]
+        for title, query in cases:
+            self.assertEqual(len(pm_query.filter_relevant([self.market(title)], [query])), 1,
+                             f"{query!r} should match {title!r}")
+
+
+class KeywordGroupIndependenceTest(unittest.TestCase):
+    """SKILL.md tells the caller to write two or three keyword groups. The
+    gate unioned them and then demanded two matches from the union, so each
+    extra phrasing made the filter stricter: one group kept the Up/Down
+    market, three groups dropped it."""
+
+    def market(self, title):
+        return {"source": "polymarket", "id": title, "title": title,
+                "outcome": "Yes", "probability": 0.5}
+
+    def test_extra_groups_never_remove_a_match(self):
+        m = self.market("Meta (META) Up or Down on August 19?")
+        one = pm_query.filter_relevant([dict(m)], ["Meta up or down"])
+        three = pm_query.filter_relevant(
+            [dict(m)], ["Meta up or down", "Meta stock price", "Meta share decline"])
+        self.assertEqual(len(one), 1)
+        self.assertEqual(len(three), 1, "adding phrasings must not tighten the filter")
+
+    def test_a_group_that_matches_nothing_does_not_veto(self):
+        m = self.market("US recession by end of 2026?")
+        kept = pm_query.filter_relevant([dict(m)], ["US recession 2026", "cat piano lessons"])
+        self.assertEqual(len(kept), 1)
+
+
+class LadderIntegrityTest(unittest.TestCase):
+    """"Close above $460" printed 92.4% while "close above $440" printed
+    90.0%. A close above 460 is also a close above 440, so one of those is an
+    unquoted stub. Six of the thirteen rungs had zero volume."""
+
+    def test_non_monotonic_ladder_is_flagged(self):
+        markets = pm_query.parse_polymarket_event(load("poly_event_ladder_nonmonotonic.json"))
+        pm_query.check_ladders(markets)
+        flagged = [m for m in markets if any("ladder" in f.lower() for f in m["flags"])]
+        self.assertTrue(flagged, "non-monotonic rungs should be called out")
+
+    def test_direction_groups_are_checked_separately(self):
+        """A touch event mixes ↓ and ↑ rungs. Each side is monotone on its
+        own while the combined sequence is not, so checking the event as one
+        sequence would fire on every such ladder."""
+        markets = []
+        for label, p in [("↓ $460", 0.02), ("↓ $480", 0.06), ("↓ $500", 0.14),
+                         ("↑ $620", 0.14), ("↑ $640", 0.08), ("↑ $660", 0.06)]:
+            markets.append({"source": "polymarket", "title": "hit in August",
+                            "outcome": label, "probability": p, "flags": []})
+        pm_query.check_ladders(markets)
+        self.assertEqual([m["outcome"] for m in markets if m["flags"]], [])
+
+    def test_real_touch_ladder_flags_only_the_broken_side(self):
+        """In the captured event the ↓ rungs are clean and the ↑ rungs are
+        not: touching $680 prints higher than touching $660."""
+        markets = pm_query.parse_polymarket_event(load("poly_event_touch_ladder.json"))
+        pm_query.check_ladders(markets)
+        down = [m for m in markets if str(m["outcome"]).startswith("↓")]
+        up = [m for m in markets if str(m["outcome"]).startswith("↑")]
+        self.assertTrue(down and up, "fixture should carry both directions")
+        self.assertFalse([m for m in down if any("ladder" in f.lower() for f in m["flags"])],
+                         "clean side must not be flagged")
+        self.assertTrue([m for m in up if any("ladder" in f.lower() for f in m["flags"])],
+                        "broken side must be flagged")
+
+    def test_short_groups_are_left_alone(self):
+        markets = [{"source": "polymarket", "title": "t", "outcome": "$100",
+                    "probability": 0.9, "flags": []},
+                   {"source": "polymarket", "title": "t", "outcome": "$200",
+                    "probability": 0.95, "flags": []}]
+        pm_query.check_ladders(markets)
+        self.assertTrue(all(not m["flags"] for m in markets))
+
+
+class SpotPriceTest(unittest.TestCase):
+    """"52% chance it touches $520" is uninterpretable without knowing the
+    stock is at $543.67. The skill had no way to say where the price is."""
+
+    def test_parses_a_quote(self):
+        quote = pm_query.parse_spot(load("yahoo_quote_meta.json"))
+        self.assertEqual(quote["symbol"], "META")
+        self.assertAlmostEqual(quote["price"], 543.67, places=2)
+        self.assertIsNotNone(quote["fifty_two_week_low"])
+        self.assertIn("Yahoo", quote["source"])
+
+
+class FetchedAtTest(unittest.TestCase):
+    """The mandated output format requires a data timestamp, and step 4 says
+    to run detail before writing the answer — but only search returned one."""
+
+    def test_detail_payload_carries_a_timestamp(self):
+        market = pm_query.blank_market("polymarket")
+        pm_query.stamp(market)
+        self.assertIn("fetched_at", market)
+
+
+class RankingTest(unittest.TestCase):
+    """Ranking by volume alone put "Meta headcount this year" above the Meta
+    price ladders for a stock-price question: both mention Meta, but only one
+    matches what was asked, and the wrong one trades more."""
+
+    def market(self, title, matched, volume):
+        return {"source": "kalshi", "id": title, "title": title, "outcome": "Yes",
+                "probability": 0.5, "matched": matched, "volume_usd": volume,
+                "volume_24h_usd": None, "volume_7d_usd": None}
+
+    def test_more_matched_words_outrank_more_volume(self):
+        headcount = self.market("Meta headcount this year", ["meta"], 5_000_000.0)
+        ladder = self.market("What will Meta Platforms (META) hit in August?",
+                             ["meta", "platform"], 2_000.0)
+        ranked = sorted([headcount, ladder], key=pm_query.rank_key)
+        self.assertEqual(ranked[0]["title"], ladder["title"])
+
+    def test_volume_still_breaks_ties(self):
+        thin = self.market("A", ["meta", "platform"], 1_000.0)
+        deep = self.market("B", ["meta", "platform"], 9_000_000.0)
+        ranked = sorted([thin, deep], key=pm_query.rank_key)
+        self.assertEqual(ranked[0]["title"], "B")

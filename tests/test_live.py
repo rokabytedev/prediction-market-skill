@@ -79,6 +79,65 @@ class PositiveControls(unittest.TestCase):
                              f"settled market leaked: {m['title']} / {m['outcome']}")
 
 
+class RecallControls(unittest.TestCase):
+    """The half of the calibration that was missing.
+
+    The gate was tuned only against questions that must return nothing, so it
+    happily returned nothing for questions that must return something: ten
+    live Meta events were trading while `search "Meta stock price"` reported
+    no_live_market. Short entity names were the blind spot — every ticker and
+    most proper nouns are under six letters.
+    """
+
+    ENTITIES = ["Meta stock price", "Tesla stock price", "Apple stock price",
+                "Bitcoin price", "Nvidia stock price", "Trump approval",
+                "Fed decision"]
+
+    def test_common_entities_are_never_reported_as_having_no_market(self):
+        for query in self.ENTITIES:
+            with self.subTest(query):
+                payload = pm_query.run_search(
+                    [query], ["polymarket", "kalshi", "manifold"], limit=3)
+                self.assertNotEqual(payload.get("verdict"), "no_live_market",
+                                    f"{query!r} wrongly reported as having no market")
+                self.assertTrue(payload["candidates"])
+
+    def test_extra_phrasings_never_shrink_the_result(self):
+        """SKILL.md asks for two or three keyword groups; following that
+        advice used to make recall worse, not better."""
+        one = pm_query.run_search(["Meta up or down"], ["polymarket"], limit=3)
+        three = pm_query.run_search(
+            ["Meta up or down", "Meta stock price", "Meta share decline"],
+            ["polymarket"], limit=3)
+        self.assertGreaterEqual(len(three["candidates"]), len(one["candidates"]))
+
+    def test_price_ladders_come_back_whole(self):
+        """A 14-rung ladder is the shape that answers "how far", and per-venue
+        trimming used to slice it to four rows with no indication."""
+        payload = pm_query.run_search(["Meta Platforms"], ["polymarket"], limit=3)
+        biggest = max((e["outcomes_returned"] for e in payload.get("events", [])), default=0)
+        self.assertGreater(biggest, 5, "ladders should not be trimmed to a handful of rungs")
+
+
+class OutcomeLabelControls(unittest.TestCase):
+    def test_every_candidate_says_which_outcome_its_price_belongs_to(self):
+        payload = pm_query.run_search(
+            ["Meta up or down", "US recession 2026"],
+            ["polymarket", "kalshi", "manifold"], limit=3)
+        self.assertTrue(payload["candidates"])
+        for m in payload["candidates"]:
+            self.assertIsNotNone(m["probability_of"], f"unlabelled price: {m['title']}")
+            self.assertTrue(m["outcome_prices"])
+
+
+class SpotControls(unittest.TestCase):
+    def test_spot_anchors_a_price_ladder(self):
+        quote = pm_query.fetch_spot("META")
+        self.assertGreater(quote["price"], 0)
+        self.assertEqual(quote["symbol"], "META")
+        self.assertIn("fetched_at", quote)
+
+
 class DetailControls(unittest.TestCase):
     def test_polymarket_detail_carries_trend_depth_and_rules(self):
         payload = pm_query.run_search(["US recession 2026"], ["polymarket"], limit=1)
@@ -89,6 +148,7 @@ class DetailControls(unittest.TestCase):
         self.assertGreater(len(market.get("history") or []), 5)
         self.assertIsNotNone(market["participants"])
         self.assertEqual(market["participants_label"], "holders")
+        self.assertIn("fetched_at", market)
 
     def test_gamma_identity_is_verified(self):
         """A mistyped filter returns someone else's market with a 200."""

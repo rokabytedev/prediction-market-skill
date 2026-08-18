@@ -78,6 +78,39 @@ price:
 - **Thin markets drift.** Without arbitrageurs, a stale price can sit wrong for
   weeks.
 
+## Reading a ladder
+
+A "how far" question is answered by a set of rungs at different thresholds, and
+the shape of that set is the answer. Three things decide whether it means
+anything.
+
+**Anchor it.** A rung reading 52 percent says nothing until you know where the
+price is now. Fetch the spot price and lead with it; otherwise the reader cannot
+tell whether 52 percent is a routine wobble or a crisis.
+
+**Know what "hit" means.** A touch ladder resolves if the level is reached at
+any instant during the window — often on a one-minute low, sometimes only during
+regular trading hours. A close ladder resolves on the closing print. The same
+level prices very differently under the two rules, and titles rarely say which.
+
+**Check it is internally consistent.** Whatever is true above 460 is also true
+above 440, so a threshold ladder must be monotone. When it is not — and
+Polymarket printed 92.4 percent for one and 90.0 percent for the other, on rungs
+with no volume — the out-of-order rungs are unquoted maker stubs, not prices.
+The script flags this. Treat the whole ladder as indicative when it fires.
+
+Non-exclusive ladders (touch levels) legitimately sum past 100 percent, because
+touching 540 and touching 520 are not alternatives. Mutually exclusive buckets
+(price lands in one range) must sum to about 100; when they sum to 176, nobody
+is quoting them.
+
+## A note on liquidity figures
+
+Resting-order depth is a snapshot of the book at the instant of the call, not a
+stable property. On a thin market it can move severalfold within a minute — two
+calls a moment apart returned 3,727 and 3,097 on the same rung. Quote it as
+"depth right now", and do not treat a change between two calls as an error.
+
 ## What to say when there is no market
 
 Say there is no market. That is a real answer and often the honest one — most

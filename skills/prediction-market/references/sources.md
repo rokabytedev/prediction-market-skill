@@ -65,6 +65,15 @@ event showed $3.1M at event level while the live sub-markets held a fraction of
 it. Judging credibility on the event total overstates it by an order of
 magnitude. Use `volumeNum` / `volume24hr` / `liquidityNum` on the sub-market.
 
+### Outcome labels are not always Yes/No
+
+`outcomes` sits beside `outcomePrices` and is easy to skip, because most markets
+are `["Yes", "No"]` and the first price is the one you want. Some are not:
+`Meta (META) Up or Down on August 19?` carries `["Up", "Down"]`. Reading
+`outcomePrices[0]` as "probability of yes" turns a 55 percent chance the stock
+*rises* into a 55 percent chance it *falls*. Always carry the label with the
+price.
+
 ### Price history
 
 ```

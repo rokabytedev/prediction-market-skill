@@ -83,6 +83,8 @@ def blank_market(source):
         "title": None,
         "outcome": None,
         "probability": None,
+        "probability_of": None,
+        "outcome_prices": [],
         "prob_24h_change": None,
         "prob_7d_change": None,
         "volume_usd": None,
@@ -105,6 +107,28 @@ def blank_market(source):
 # --------------------------------------------------------------------------
 # Credibility
 # --------------------------------------------------------------------------
+
+def stamp(market):
+    """Every payload the model quotes needs a data time — the answer format
+    requires one and `detail` is the call it is told to quote from."""
+    market["fetched_at"] = now_utc().isoformat(timespec="seconds")
+    return market
+
+
+def label_outcomes(market, labels, prices):
+    """Attach which outcome each price belongs to.
+
+    Without this a caller sees `probability: 0.555` on a market whose
+    outcomes are ["Up", "Down"] and has no way to tell that 0.555 is *Up*.
+    On a question phrased "will it fall" that reads as the opposite of the
+    market's view.
+    """
+    labels = [str(x) for x in (labels or [])]
+    pairs = [{"label": l, "p": p} for l, p in zip(labels, prices or []) if p is not None]
+    market["outcome_prices"] = pairs
+    market["probability_of"] = pairs[0]["label"] if pairs else None
+    return market
+
 
 def credibility_flags(market):
     """Warnings a reader needs before trusting the number. Order matters:
@@ -170,14 +194,22 @@ def finalize(market):
 # Polymarket
 # --------------------------------------------------------------------------
 
-def _poly_prices(raw_market):
-    prices = raw_market.get("outcomePrices")
-    if isinstance(prices, str):
+def _poly_json_list(raw_market, key):
+    value = raw_market.get(key)
+    if isinstance(value, str):
         try:
-            prices = json.loads(prices)
+            value = json.loads(value)
         except ValueError:
             return []
-    return [as_float(p) for p in (prices or [])]
+    return list(value or [])
+
+
+def _poly_prices(raw_market):
+    return [as_float(p) for p in _poly_json_list(raw_market, "outcomePrices")]
+
+
+def _poly_labels(raw_market):
+    return _poly_json_list(raw_market, "outcomes")
 
 
 def is_polymarket_resolved(raw_market):
@@ -220,10 +252,12 @@ def parse_polymarket_event(event):
             "end_date_passed": bool(parsed_end and parsed_end < now_utc()),
             "url": _poly_url(event_slug, raw.get("slug")),
             "rules": raw.get("description") or event.get("description"),
+            "event_title": event.get("title"),
             "clob_token_id": (json.loads(raw["clobTokenIds"])[0]
                               if isinstance(raw.get("clobTokenIds"), str) and raw["clobTokenIds"]
                               else None),
         })
+        label_outcomes(market, _poly_labels(raw) or ["Yes", "No"], prices)
         out.append(finalize(market))
     return out
 
@@ -333,7 +367,7 @@ def detail_polymarket(condition_id):
             market["history_error"] = str(exc)
 
     market["flags"] = credibility_flags(market)
-    return market
+    return stamp(market)
 
 
 # --------------------------------------------------------------------------
@@ -382,6 +416,8 @@ def parse_kalshi_v2_markets(raw):
             "url": _kalshi_url(m.get("ticker")),
             "rules": m.get("rules_primary"),
         })
+        label_outcomes(market, ["Yes", "No"],
+                       [prob, (1 - prob) if prob is not None else None])
         out.append(finalize(market))
     return out
 
@@ -417,6 +453,8 @@ def parse_kalshi_search(raw):
                 "end_date": end,
                 "url": _kalshi_url(entry.get("series_ticker") or ticker),
             })
+            label_outcomes(market, ["Yes", "No"],
+                           [prob, (1 - prob) if prob is not None else None])
             out.append(finalize(market))
     return out
 
@@ -433,7 +471,7 @@ def detail_kalshi(ticker):
     markets = parse_kalshi_v2_markets({"markets": [raw.get("market", {})]})
     if not markets:
         raise LookupError(f"no active Kalshi market {ticker}")
-    return markets[0]
+    return stamp(markets[0])
 
 
 # --------------------------------------------------------------------------
@@ -463,6 +501,8 @@ def parse_manifold_search(raw):
             # Mana, not dollars — deliberately not written into volume_usd.
             "volume_mana": as_float(m.get("volume")),
         })
+        label_outcomes(market, ["Yes", "No"],
+                       [prob, (1 - prob) if prob is not None else None])
         out.append(finalize(market))
     return out
 
@@ -477,7 +517,7 @@ def detail_manifold(market_id):
     markets = parse_manifold_search([raw])
     if not markets:
         raise LookupError(f"no open Manifold market {market_id}")
-    return markets[0]
+    return stamp(markets[0])
 
 
 # --------------------------------------------------------------------------
@@ -544,6 +584,40 @@ def search_metaculus(keyword, limit=4):
 
 
 # --------------------------------------------------------------------------
+# Underlying spot price
+# --------------------------------------------------------------------------
+# "52% chance it touches $520" says nothing until you know where the price is
+# now. Ladder questions are unanswerable without an anchor, and inventing one
+# is exactly what this skill is built not to do.
+
+YAHOO = "https://query1.finance.yahoo.com/v8/finance/chart"
+
+
+def parse_spot(raw):
+    meta = ((raw.get("chart") or {}).get("result") or [{}])[0].get("meta") or {}
+    price = as_float(meta.get("regularMarketPrice"))
+    previous = as_float(meta.get("chartPreviousClose")) or as_float(meta.get("previousClose"))
+    return {
+        "symbol": meta.get("symbol"),
+        "price": price,
+        "previous_close": previous,
+        "change_pct": round((price / previous - 1) * 100, 2) if price and previous else None,
+        "fifty_two_week_low": as_float(meta.get("fiftyTwoWeekLow")),
+        "fifty_two_week_high": as_float(meta.get("fiftyTwoWeekHigh")),
+        "currency": meta.get("currency"),
+        "source": "Yahoo Finance — underlying spot, not a market price",
+    }
+
+
+def fetch_spot(symbol):
+    raw = http_json(f"{YAHOO}/{urllib.parse.quote(symbol)}?interval=1d&range=5d")
+    quote = parse_spot(raw)
+    if quote["price"] is None:
+        raise LookupError(f"no quote for {symbol}")
+    return stamp(quote)
+
+
+# --------------------------------------------------------------------------
 # Orchestration
 # --------------------------------------------------------------------------
 
@@ -592,6 +666,16 @@ STOPWORDS = {
     "year", "years", "today", "tomorrow", "yesterday", "week", "weeks",
     "month", "months", "day", "days", "time", "times", "date", "end", "start",
     "soon", "ever", "now",
+    # Finance filler. These appear in a large share of market titles, so
+    # letting them count as matches lets a Bitcoin ladder answer a question
+    # about Meta — which is exactly what happened.
+    "price", "prices", "priced", "stock", "stocks", "share", "shares",
+    "above", "below", "over", "under", "close", "closes", "closing", "hit",
+    "hits", "reach", "reaches", "high", "higher", "low", "lower", "cap",
+    "level", "levels", "value", "target", "trade", "trades", "trading",
+    "move", "moves", "rise", "rises", "fall", "falls", "drop", "drops",
+    # Country filler: too common in titles to discriminate.
+    "us", "usa", "u", "s",
 }
 
 TOKEN_RE = re.compile(r"[a-z0-9]+")
@@ -643,36 +727,105 @@ def token_weights(text):
 
 
 def filter_relevant(markets, keywords):
-    """Keep markets sharing at least one content word with the query.
+    """Keep markets that clear the bar for at least one keyword group.
 
-    Fails open: if the query carries no content words there is nothing to
-    match on, and silently returning zero results would look like "no market
-    exists" when we simply could not tell.
+    Groups are scored **independently**. Unioning them and then demanding two
+    matches from the union made every extra phrasing tighten the filter — one
+    group found Polymarket's Meta market, three groups lost it — which is the
+    opposite of what "try a few phrasings" is supposed to do.
+
+    Fails open: a query with no content words has nothing to match on, and
+    returning nothing would masquerade as "no market exists".
     """
-    weights = {}
-    for keyword in keywords:
-        for stemmed, length in token_weights(keyword).items():
-            weights[stemmed] = max(weights.get(stemmed, 0), length)
-    wanted = set(weights)
-    if not wanted:
+    groups = [w for w in (token_weights(k) for k in keywords) if w]
+    if not groups:
         return markets
-
-    # One shared word is usually coincidence — "US recession" against "2Y US
-    # Treasury yield today?" shares `us` and nothing that matters. So ask for
-    # two, unless the one word is specific enough to carry the question by
-    # itself: Kalshi calls its market "Recession this year?", and dropping it
-    # over a missing second word would be its own kind of wrong answer.
-    needed = min(2, len(wanted))
 
     kept = []
     for market in markets:
-        haystack = content_tokens(f"{market.get('title') or ''} {market.get('outcome') or ''}")
-        matched = sorted(wanted & haystack)
-        distinctive = any(weights[t] >= DISTINCTIVE_WORD for t in matched)
-        if len(matched) >= needed or distinctive:
-            market["matched"] = matched
+        haystack = content_tokens(
+            f"{market.get('title') or ''} {market.get('outcome') or ''}")
+        best = None
+        for weights in groups:
+            matched = sorted(set(weights) & haystack)
+            if not matched:
+                continue
+            # One shared word is usually coincidence — "US recession" against
+            # "2Y US Treasury yield today?" shares `us` and nothing that
+            # matters. Ask for two, unless the single word carries the
+            # question by itself, or the group only has one word to give.
+            needed = min(2, len(weights))
+            distinctive = any(weights[t] >= DISTINCTIVE_WORD for t in matched)
+            if len(matched) >= needed or distinctive:
+                if best is None or len(matched) > len(best):
+                    best = matched
+        if best is not None:
+            market["matched"] = best
             kept.append(market)
     return kept
+
+
+# --------------------------------------------------------------------------
+# Ladder integrity
+# --------------------------------------------------------------------------
+# A threshold ladder has to be monotone: whatever is true above $460 is also
+# true above $440. Polymarket printed 92.4% for one and 90.0% for the other,
+# on rungs with no volume behind them. Those are maker stubs, and they look
+# exactly like prices.
+
+LADDER_NUMBER = re.compile(r"\d[\d,]*(?:\.\d+)?")
+LADDER_TOLERANCE = 0.005
+LADDER_MIN_RUNGS = 3
+
+
+def _ladder_parts(market):
+    """(shape, threshold) for a rung, where shape is the label with its number
+    blanked out. Keeps '↓ $520' and '↑ $620' in separate ladders — each side
+    is monotone on its own even though the combined sequence is not."""
+    label = str(market.get("outcome") or "")
+    found = LADDER_NUMBER.search(label)
+    if not found:
+        return None
+    value = as_float(found.group(0).replace(",", ""))
+    if value is None:
+        return None
+    shape = (label[: found.start()] + "#" + label[found.end():]).strip()
+    return shape, value
+
+
+def check_ladders(markets):
+    """Flag rungs whose prices contradict each other. Mutates `markets`."""
+    groups = {}
+    for market in markets:
+        parts = _ladder_parts(market)
+        if not parts or market.get("probability") is None:
+            continue
+        shape, value = parts
+        key = (market.get("source"), market.get("event_title") or market.get("title"), shape)
+        groups.setdefault(key, []).append((value, market))
+
+    for (_, _, shape), rungs in groups.items():
+        if len(rungs) < LADDER_MIN_RUNGS:
+            continue
+        rungs.sort(key=lambda pair: pair[0])
+        ups = downs = 0
+        worst = None
+        for (lo_v, lo_m), (hi_v, hi_m) in zip(rungs, rungs[1:]):
+            delta = hi_m["probability"] - lo_m["probability"]
+            if delta > LADDER_TOLERANCE:
+                ups += 1
+                if worst is None or delta > worst[0]:
+                    worst = (delta, lo_m, hi_m)
+            elif delta < -LADDER_TOLERANCE:
+                downs += 1
+        if ups and downs and worst:
+            _, lo_m, hi_m = worst
+            note = (f"⚠️ Ladder inconsistent: {hi_m['outcome']} prints "
+                    f"{hi_m['probability']:.1%} while {lo_m['outcome']} prints "
+                    f"{lo_m['probability']:.1%} — some rungs are unquoted stubs")
+            for _, market in rungs:
+                if note not in market["flags"]:
+                    market["flags"].append(note)
 
 
 def drop_unpriced(markets):
@@ -704,7 +857,20 @@ def build_search_payload(keywords, sources, errors, markets):
     return payload
 
 
-def run_search(keywords, sources, limit):
+def rank_key(market):
+    """Relevance first, then money. A market that matches more of the
+    question beats one that merely trades more."""
+    return (-len(market.get("matched") or []), -_activity(market))
+
+
+def _event_key(market):
+    return (market.get("source"), market.get("event_title") or market.get("title"))
+
+
+MAX_RUNGS_PER_EVENT = 20
+
+
+def run_search(keywords, sources, limit, show_dropped=False):
     jobs, results, errors = [], [], {}
     with ThreadPoolExecutor(max_workers=8) as pool:
         for source in sources:
@@ -716,25 +882,60 @@ def run_search(keywords, sources, limit):
             except Exception as exc:
                 errors.setdefault(source, f"{type(exc).__name__}: {exc}")
 
+    priced = drop_unpriced(results)
+    relevant = filter_relevant(priced, keywords)
+    relevant_ids = {(m["source"], m["id"]) for m in relevant}
+    dropped = [m for m in priced if (m["source"], m["id"]) not in relevant_ids]
+
     seen, deduped = set(), []
-    relevant = filter_relevant(drop_unpriced(results), keywords)
-    dropped = len(drop_unpriced(results)) - len(relevant)
-    for market in sorted(relevant, key=_activity, reverse=True):
+    for market in sorted(relevant, key=rank_key):
         key = (market["source"], market["id"])
         if key in seen:
             continue
         seen.add(key)
         deduped.append(market)
 
-    ranked = {}
+    # Trim whole events, never individual rungs. A 14-rung ladder is the
+    # ideal shape for a "how far" question, and slicing the top four markets
+    # off the pile destroys it without saying so.
+    grouped, order = {}, []
     for market in deduped:
-        ranked.setdefault(market["source"], []).append(market)
-    trimmed = [m for source in sources for m in ranked.get(source, [])[:limit]]
-    trimmed.sort(key=_activity, reverse=True)
+        key = _event_key(market)
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(market)
+
+    per_source, trimmed = {}, []
+    for key in order:
+        source = key[0]
+        if per_source.get(source, 0) >= limit:
+            continue
+        per_source[source] = per_source.get(source, 0) + 1
+        trimmed.extend(grouped[key][:MAX_RUNGS_PER_EVENT])
+
+    check_ladders(trimmed)
+    trimmed.sort(key=rank_key)
 
     payload = build_search_payload(keywords, sources, errors, trimmed)
+    payload["events"] = [
+        {
+            "source": key[0],
+            "title": key[1],
+            "outcomes_returned": len(grouped[key][:MAX_RUNGS_PER_EVENT]),
+            "outcomes_total": len(grouped[key]),
+            "url": grouped[key][0].get("url"),
+        }
+        for key in order if any(m in trimmed for m in grouped[key])
+    ]
     if dropped:
-        payload["dropped_as_irrelevant"] = dropped
+        payload["dropped_as_irrelevant"] = len(dropped)
+        if show_dropped:
+            payload["dropped_examples"] = [
+                {"source": m["source"], "title": m.get("title"),
+                 "outcome": m.get("outcome"), "matched": m.get("matched", [])}
+                for m in dropped[:25]
+            ]
     return payload
 
 
@@ -751,6 +952,7 @@ def run_compare(refs):
         except Exception as exc:
             errors[ref] = f"{type(exc).__name__}: {exc}"
     payload = {"fetched_at": now_utc().isoformat(timespec="seconds"), "markets": markets}
+    check_ladders(markets)
     note = divergence_note(markets)
     if note:
         payload["divergence"] = note
@@ -767,7 +969,9 @@ def main(argv=None):
     p_search = sub.add_parser("search", help="search every venue for live markets")
     p_search.add_argument("keywords", nargs="+", help="English keyword groups")
     p_search.add_argument("--sources", default="polymarket,kalshi,manifold")
-    p_search.add_argument("--limit", type=int, default=4, help="markets kept per venue")
+    p_search.add_argument("--limit", type=int, default=4, help="events kept per venue")
+    p_search.add_argument("--show-dropped", action="store_true",
+                          help="list what the relevance gate rejected")
 
     p_detail = sub.add_parser("detail", help="deep data for one market")
     p_detail.add_argument("source", choices=sorted(DETAILERS))
@@ -777,13 +981,22 @@ def main(argv=None):
         "compare", help="compare markets you have judged to be the same question")
     p_compare.add_argument("refs", nargs="+", metavar="source:id")
 
+    p_spot = sub.add_parser(
+        "spot", help="underlying price for a ticker, to anchor a price ladder")
+    p_spot.add_argument("symbol")
+
     args = parser.parse_args(argv)
 
     if args.command == "search":
         sources = [s.strip() for s in args.sources.split(",") if s.strip() in SEARCHERS]
-        payload = run_search(args.keywords, sources, args.limit)
+        payload = run_search(args.keywords, sources, args.limit, args.show_dropped)
     elif args.command == "compare":
         payload = run_compare(args.refs)
+    elif args.command == "spot":
+        try:
+            payload = fetch_spot(args.symbol)
+        except Exception as exc:
+            payload = {"error": f"{type(exc).__name__}: {exc}", "symbol": args.symbol}
     else:
         try:
             payload = DETAILERS[args.source](args.id)
