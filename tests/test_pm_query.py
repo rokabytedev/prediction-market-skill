@@ -1414,3 +1414,145 @@ class PlaceholderContractTest(unittest.TestCase):
         untouched coin flip carries no information at all."""
         markets = [self.stub("Utah Jazz", 0.0075, 0.0)]
         self.assertEqual(len(pm_query.drop_stubs(markets)), 1)
+
+
+# ==========================================================================
+# Sixth round: false alarms that the "relay every flag" rule would push
+# straight to the reader, plus a parser bug that fabricates levels.
+# ==========================================================================
+
+
+class CumulativeFieldTest(unittest.TestCase):
+    """Kalshi's "When will Bitcoin cross $100k again?" lists nested windows —
+    before September, before October, before January — each containing the
+    last. They are not alternatives, so summing them to 22% and reporting
+    "78% sits on outcomes not shown" is false, and the rule that every flag
+    must be relayed pushes it to the reader."""
+
+    def windows(self, title, labels_and_probs):
+        return [{"source": "kalshi", "title": title, "event_title": title,
+                 "event_id": title, "outcome": label, "probability": p, "flags": []}
+                for label, p in labels_and_probs]
+
+    def test_nested_windows_are_not_summed(self):
+        markets = self.windows("When will Bitcoin cross $100k again?",
+                               [("Before September 2026", 0.01), ("Before October 2026", 0.02),
+                                ("Before November 2026", 0.03), ("Before December 2026", 0.06),
+                                ("Before January 2027", 0.10)])
+        pm_query.check_distribution(markets)
+        self.assertEqual([f for m in markets for f in m["flags"]], [])
+
+    def test_a_real_exclusive_field_still_reports(self):
+        markets = self.windows("Who will win the Nobel Peace Prize?",
+                               [("Navalnaya", 0.085), ("Zelenskyy", 0.054),
+                                ("UNRWA", 0.0425), ("Trump", 0.0245)])
+        pm_query.check_distribution(markets)
+        self.assertTrue([f for m in markets for f in m["flags"] if "incomplete" in f.lower()])
+
+
+class SameLevelScopeTest(unittest.TestCase):
+    """The check's own docstring says "on one venue". Without a source test it
+    used a 33-bettor play-money market to accuse a real-money one of being
+    wrong — while that same row carried "no resolution text available"."""
+
+    def market(self, source, title, outcome, p):
+        m = pm_query.blank_market(source)
+        m.update({"id": source + outcome, "title": title, "event_title": title,
+                  "event_id": source + title, "outcome": outcome, "probability": p,
+                  "end_date": "2026-12-31T00:00:00Z",
+                  "rules": "resolves if reached at any point"})
+        return m
+
+    def test_play_money_is_never_the_counterparty(self):
+        markets = [self.market("polymarket", "What price will Bitcoin hit in 2026?",
+                               "↓ 40,000", 0.14),
+                   self.market("manifold", "Will bitcoin go below $40,000 in 2026?",
+                               "Yes", 0.165)]
+        pm_query.check_same_level(markets)
+        self.assertEqual([f for m in markets for f in m["flags"]], [])
+
+    def test_each_row_states_its_own_number_first(self):
+        """The identical note was appended to both markets, so on one of them
+        "2.5% here" pointed at the other market's price."""
+        a = self.market("polymarket", "What price will Bitcoin hit in 2026?", "↑ 150,000", 0.0245)
+        b = self.market("polymarket", "Will Bitcoin hit $150k by December 31, 2026?",
+                        "by December 31, 2026", 0.0125)
+        pm_query.check_same_level([a, b])
+        self.assertTrue(a["flags"] and b["flags"])
+        self.assertIn("2.5% here", a["flags"][0])
+        self.assertIn("1.2% here", b["flags"][0])
+
+
+class LevelSuffixTest(unittest.TestCase):
+    """"$149999.99 by Dec 31" parsed as 1.5e14: the optional k/m/b suffix ate
+    the b of "by". Levels then match nothing, so real contradictions go
+    unreported and compare invents a "different levels" objection."""
+
+    def level(self, title):
+        return pm_query._level_of({"event_title": title, "title": title,
+                                   "outcome": "Yes", "probability": 0.5})
+
+    def test_by_is_not_a_billion_suffix(self):
+        self.assertEqual(self.level("Will Bitcoin be above $149999.99 by Dec 31, 2026?"),
+                         149999.99)
+        self.assertEqual(self.level("Will Meta hit $500 by August?"), 500.0)
+
+    def test_real_suffixes_still_scale(self):
+        self.assertEqual(self.level("Will Bitcoin hit $150k by December 31, 2026?"), 150_000.0)
+        self.assertEqual(self.level("Will the market cap top $3b this year?"), 3_000_000_000.0)
+
+
+class CompareRatioTest(unittest.TestCase):
+    """compare called 2.45% and 1.25% agreement — a 1.2 point spread and
+    nearly double the price — while the search path called the same pair
+    "at least one is wrong"."""
+
+    def test_a_doubled_price_is_not_agreement(self):
+        summary = pm_query.compare_summary([
+            {"source": "polymarket", "probability": 0.0245, "end_date": "2026-12-31T00:00:00Z",
+             "rules": "resolves if the price is reached at any point"},
+            {"source": "polymarket", "probability": 0.0125, "end_date": "2026-12-31T00:00:00Z",
+             "rules": "resolves if the price is reached at any point"},
+        ])
+        self.assertFalse(summary["agree"])
+
+    def test_a_close_pair_still_agrees(self):
+        summary = pm_query.compare_summary([
+            {"source": "polymarket", "probability": 0.515, "end_date": "2026-11-03T00:00:00Z",
+             "rules": "resolves when the party completes a majority"},
+            {"source": "kalshi", "probability": 0.49, "end_date": "2026-11-03T00:00:00Z",
+             "rules": "resolves when the party completes a majority"},
+        ])
+        self.assertTrue(summary["agree"])
+
+
+class DeadlineProximityTest(unittest.TestCase):
+    """`timedelta.days` truncates, so 7 days 23 hours counted as 7 and a
+    market ending 24 August was compared against one ending 1 September
+    under a flag that says "same deadline". Touching a level inside a short
+    window and inside a long one are not comparable."""
+
+    def touch(self, title, outcome, p, end):
+        m = pm_query.blank_market("polymarket")
+        m.update({"id": title + outcome, "title": title, "event_title": title,
+                  "event_id": title, "outcome": outcome, "probability": p,
+                  "end_date": end, "rules": "resolves if reached at any point"})
+        return m
+
+    def test_a_week_apart_is_not_the_same_deadline(self):
+        markets = [self.touch("What price will Bitcoin hit August 17-23?", "↑ 74,000",
+                              0.003, "2026-08-24T04:00:00Z"),
+                   self.touch("What price will Bitcoin hit in 2026?", "↑ 100,000",
+                              0.010, "2026-09-01T03:59:00Z")]
+        pm_query.check_cross_event_thresholds(markets)
+        self.assertEqual([f for m in markets for f in m["flags"]], [])
+
+    def test_a_minute_apart_is_the_same_deadline(self):
+        """Same pair of deadlines, but priced so the higher threshold is the
+        dearer one — which cannot hold, and must still be caught."""
+        markets = [self.touch("What price will Bitcoin hit in August?", "↑ 100,000",
+                              0.010, "2026-09-01T04:00:00Z"),
+                   self.touch("When will Bitcoin cross 100k? hit $100k", "↑ 90,000",
+                              0.001, "2026-09-01T03:59:00Z")]
+        pm_query.check_cross_event_thresholds(markets)
+        self.assertTrue([f for m in markets for f in m["flags"]])

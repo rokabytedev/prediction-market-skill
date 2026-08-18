@@ -61,7 +61,8 @@ means nothing could be queried, which is not the same as nothing existing.
 
 Coverage is capped two ways: `--limit` events per venue (default 8) and
 `--max-outcomes` per event (default 20). `--limit` does **not** widen a
-truncated ladder — that needs `--max-outcomes`. `limit_note`,
+truncated ladder — that needs `--max-outcomes`. Price ladders routinely run past
+20 rungs, so on a "how far" question raise it before reading the shape. `limit_note`,
 `events_not_returned` and `possibly_truncated` say when either bit. `--show-dropped` adds `dropped_examples`,
 the markets the relevance gate rejected. Check both before concluding a market
 does not exist.
@@ -161,6 +162,12 @@ is about:
 
 A flag makes those rungs indicative at best. Say which rungs it applies to
 rather than discrediting the whole answer.
+
+**These structural flags exist only in `search` output.** They compare markets
+against each other, which a single-market `detail` call cannot do, so `detail`
+returns an empty or shorter `flags` list for the same market. Carry the search
+flags forward; do not treat the detail call as the fuller picture. `detail` adds
+credibility flags of its own, so a rung you quote may need both.
 
 ### 6. Write the answer
 

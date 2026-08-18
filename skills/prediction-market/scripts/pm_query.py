@@ -783,6 +783,14 @@ def check_windows(markets):
 
 
 CROSS_EVENT_DAYS = 7
+# Comparing two thresholds needs the deadlines to be the same deadline, not
+# merely the same week: `.days` truncation let 7 days 23 hours pass as 7, so
+# a market ending 24 August was checked against one ending 1 September.
+SAME_DEADLINE_HOURS = 36
+
+
+def _same_deadline(a, b):
+    return abs((a - b).total_seconds()) <= SAME_DEADLINE_HOURS * 3600
 
 
 def check_cross_event_thresholds(markets):
@@ -817,10 +825,10 @@ def check_cross_event_thresholds(markets):
         for m_b, v_b, dir_b, end_b, u_b in entries[i + 1:]:
             if m_a is m_b or v_a == v_b or dir_a != dir_b:
                 continue
+            if not _same_deadline(end_a, end_b):
+                continue
             if (m_a.get("event_title") or m_a.get("title")) == (m_b.get("event_title") or m_b.get("title")):
                 continue  # same event — the ladder check owns this
-            if abs((end_a - end_b).days) > CROSS_EVENT_DAYS:
-                continue
             if not _same_underlying(u_a, u_b):
                 continue
             low, high = (m_a, m_b) if v_a < v_b else (m_b, m_a)
@@ -834,8 +842,12 @@ def check_cross_event_thresholds(markets):
                         market["flags"].append(note)
 
 
-TITLE_LEVEL = re.compile(r"\$\s*(\d[\d,]*(?:\.\d+)?)\s*([kmb])?|(\d[\d,]*(?:\.\d+)?)\s*([kmb])\b",
-                         re.I)
+# The suffix must not be the first letter of the next word: "$149999.99 by
+# Dec 31" was read as 1.5e14 because the b of "by" counted as billions.
+TITLE_LEVEL = re.compile(
+    r"\$\s*(\d[\d,]*(?:\.\d+)?)\s*([kmb])?(?![a-z0-9])"
+    r"|(\d[\d,]*(?:\.\d+)?)\s*([kmb])(?![a-z0-9])",
+    re.I)
 SAME_LEVEL_TOLERANCE = 0.02
 SAME_LEVEL_RATIO = 1.5
 SAME_LEVEL_FLOOR = 0.01
@@ -883,7 +895,13 @@ def check_same_level(markets):
         for m_b, lvl_b, end_b, u_b in entries[i + 1:]:
             if m_a.get("event_id") == m_b.get("event_id"):
                 continue
-            if lvl_a != lvl_b or abs((end_a - end_b).days) > CROSS_EVENT_DAYS:
+            # One venue quoting itself two ways is a contradiction. A
+            # real-money market differing from play money is not, and using
+            # a 33-bettor market to accuse one of being wrong inverts the
+            # skill's own ranking of the venues.
+            if m_a.get("source") != m_b.get("source") or m_a.get("source") not in REAL_MONEY:
+                continue
+            if lvl_a != lvl_b or not _same_deadline(end_a, end_b):
                 continue
             if not _same_underlying(u_a, u_b):
                 continue
@@ -896,10 +914,12 @@ def check_same_level(markets):
             doubled = hi >= SAME_LEVEL_FLOOR and lo > 0 and hi / lo >= SAME_LEVEL_RATIO
             if not (wide or doubled):
                 continue
-            note = (f"⚠️ Same level priced twice: {m_a['probability']:.1%} here vs "
-                    f"{m_b['probability']:.1%} on another market for the same level "
-                    f"and deadline — at least one is wrong")
-            for market in (m_a, m_b):
+            # Written per row: one shared sentence meant "here" pointed at
+            # the other market's number on whichever row it was appended to.
+            for market, other in ((m_a, m_b), (m_b, m_a)):
+                note = (f"⚠️ Same level priced twice: {market['probability']:.1%} here vs "
+                        f"{other['probability']:.1%} on {other.get('display_title') or 'another market'}"
+                        f" — same level and deadline, so at least one is wrong")
                 if note not in market["flags"]:
                     market["flags"].append(note)
 
@@ -1344,6 +1364,26 @@ MULTI_WINNER_MARKS = ("playoff", "qualify", "advance", "make the", "reach the",
                       "relegat", "promot")
 
 
+CUMULATIVE_TITLE_MARKS = ("when will", "how soon", "when does", "when is")
+CUMULATIVE_LABEL_MARKS = ("before ", "by ", "on or before")
+
+
+def _is_cumulative_field(title, rungs):
+    """Nested deadlines rather than alternatives.
+
+    "When will Bitcoin cross $100k again?" lists before-September,
+    before-October, before-January — each window contains the last, so the
+    prices are supposed to climb and their sum means nothing. Treating them
+    as a distribution reported "78% sits on outcomes not shown" about a field
+    that was complete.
+    """
+    if any(mark in (title or "").lower() for mark in CUMULATIVE_TITLE_MARKS):
+        return True
+    labelled = sum(1 for m in rungs
+                   if str(m.get("outcome") or "").lower().startswith(CUMULATIVE_LABEL_MARKS))
+    return labelled * 2 >= len(rungs)
+
+
 def check_distribution(markets):
     """Mutually exclusive fields must add up. Mutates `markets`.
 
@@ -1371,6 +1411,8 @@ def check_distribution(markets):
             continue  # thresholds, not alternatives
         if any(mark in title.lower() for mark in MULTI_WINNER_MARKS):
             continue  # several outcomes win at once; the sum means nothing
+        if _is_cumulative_field(title, rungs):
+            continue  # nested deadlines, each containing the last
         total = sum(m["probability"] for m in rungs)
         if total >= DISTRIBUTION_CEILING:
             continue  # not a one-winner board, whatever it is
@@ -1590,7 +1632,16 @@ def compare_summary(markets):
     if len(probs) >= 2:
         spread = (max(probs) - min(probs)) * 100
         summary["spread_pp"] = round(spread, 1)
-        summary["agree"] = spread <= COMPARE_SLOP_PP
+        hi, lo = max(probs), min(probs)
+        # On small probabilities the point spread stays inside the slop while
+        # one price is twice the other, which the search path already calls a
+        # contradiction. Both paths now answer the same way.
+        doubled = lo > 0 and hi / lo >= SAME_LEVEL_RATIO and hi >= SAME_LEVEL_FLOOR
+        summary["agree"] = spread <= COMPARE_SLOP_PP and not doubled
+        if doubled:
+            summary["caveats"].append(
+                f"{hi:.1%} is {hi / lo:.1f}x {lo:.1%} — a small point spread, but the "
+                f"two prices disagree by a wide margin at this probability")
     ends = [parse_iso(m.get("end_date")) for m in markets]
     known_ends = [e for e in ends if e]
     unverified = False
