@@ -1,0 +1,25 @@
+{
+  "name": "prediction-market-skill",
+  "owner": {
+    "name": "rokabytedev",
+    "url": "https://github.com/rokabytedev"
+  },
+  "metadata": {
+    "description": "Ask a prediction market what the odds are, instead of guessing."
+  },
+  "description": "Ask a prediction market what the odds are, instead of guessing.",
+  "version": "1.0.0",
+  "plugins": [
+    {
+      "name": "prediction-market",
+      "source": "./",
+      "description": "Read-only lookup of live odds on Polymarket, Kalshi, Manifold and Metaculus, with volume-based credibility checks. Says 'no market' instead of inventing a number.",
+      "version": "1.0.0",
+      "author": { "name": "rokabytedev" },
+      "repository": "https://github.com/rokabytedev/prediction-market-skill",
+      "license": "MIT",
+      "category": "research",
+      "tags": ["prediction-markets", "polymarket", "kalshi", "forecasting", "odds", "research"]
+    }
+  ]
+}

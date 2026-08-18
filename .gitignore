@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+*.zip
+dist/
+.pytest_cache/
+.DS_Store
+tests/_live_out/

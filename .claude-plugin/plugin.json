@@ -1,0 +1,10 @@
+{
+  "name": "prediction-market",
+  "version": "1.0.0",
+  "description": "Read-only lookup of live odds on Polymarket, Kalshi, Manifold and Metaculus, with volume-based credibility checks. Says 'no market' instead of inventing a number.",
+  "author": { "name": "rokabytedev", "url": "https://github.com/rokabytedev" },
+  "homepage": "https://github.com/rokabytedev/prediction-market-skill",
+  "repository": "https://github.com/rokabytedev/prediction-market-skill",
+  "license": "MIT",
+  "keywords": ["prediction-markets", "polymarket", "kalshi", "manifold", "metaculus", "forecasting", "odds"]
+}
