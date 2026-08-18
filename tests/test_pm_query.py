@@ -1337,3 +1337,80 @@ class SkillDocLintTest(unittest.TestCase):
         base = os.path.join(HERE, "..", "skills", "prediction-market")
         for rel in re.findall(r"`(scripts/[\w./-]+|references/[\w./-]+)`", self.doc()):
             self.assertTrue(os.path.exists(os.path.join(base, rel)), f"missing {rel}")
+
+
+# ==========================================================================
+# Fifth round: a sports field exposed two ways the distribution work was
+# wrong — one inherited, one introduced by the previous round (2026-08-18).
+# ==========================================================================
+
+
+class MultiWinnerFieldTest(unittest.TestCase):
+    """Sixteen teams make the playoffs, so thirty "will they make it" markets
+    are supposed to sum to about 1600%. Calling that "quotes contradict each
+    other" tells the reader a healthy market is broken — and SKILL.md
+    requires the warning be relayed."""
+
+    def field(self, title, probs):
+        out = []
+        for i, p in enumerate(probs):
+            m = pm_query.blank_market("polymarket")
+            m.update({"id": f"{title}{i}", "title": title, "event_title": title,
+                      "event_id": title, "outcome": f"Team {chr(65 + i)}",
+                      "probability": p, "volume_usd": 10_000.0})
+            out.append(m)
+        return out
+
+    def test_a_playoff_field_is_not_called_contradictory(self):
+        markets = self.field("NBA: Team to Make Playoffs", [0.98, 0.95, 0.9, 0.85, 0.6, 0.4])
+        pm_query.check_distribution(markets)
+        self.assertEqual([f for m in markets for f in m["flags"]], [])
+
+    def test_a_field_summing_far_past_one_is_left_alone(self):
+        """Whatever it is, it is not one-winner, so neither reading applies."""
+        markets = self.field("Which teams qualify?", [0.9, 0.9, 0.9, 0.9, 0.9])
+        pm_query.check_distribution(markets)
+        self.assertEqual([f for m in markets for f in m["flags"]], [])
+
+    def test_normal_bookmaker_margin_is_not_an_error(self):
+        """A complete futures board runs a few points over 100%."""
+        markets = self.field("NBA: 2027 Champion", [0.215, 0.205, 0.13, 0.115, 0.045,
+                                                    0.0375, 0.0345, 0.0325, 0.0315, 0.21])
+        pm_query.check_distribution(markets)
+        self.assertEqual([f for m in markets for f in m["flags"]], [])
+
+    def test_a_genuinely_incoherent_board_still_fires(self):
+        markets = self.field("Who will win the Nobel Peace Prize?",
+                             [0.30, 0.15, 0.12, 0.08, 0.07, 0.07, 0.20, 0.20])
+        pm_query.check_distribution(markets)
+        self.assertTrue([f for m in markets for f in m["flags"] if "incoheren" in f.lower()])
+
+
+class PlaceholderContractTest(unittest.TestCase):
+    """Ordering a named field by probability — the previous round's fix —
+    floated untraded stubs to the top: "Team A", "Team B" and "Other" all at
+    exactly 0.5 with no volume, printed above the real 23% favourite."""
+
+    def stub(self, outcome, p, volume):
+        m = pm_query.blank_market("polymarket")
+        m.update({"id": outcome, "title": "NBA: 2027 Eastern Conference Champion",
+                  "event_title": "NBA: 2027 Eastern Conference Champion",
+                  "outcome": outcome, "probability": p, "volume_usd": volume})
+        return m
+
+    def test_untraded_coin_flip_stubs_are_dropped(self):
+        markets = [self.stub("Team A", 0.5, 0.0), self.stub("Team B", 0.5, 0.0),
+                   self.stub("Other", 0.5, 0.0),
+                   self.stub("Philadelphia 76ers", 0.233, 22_282.0)]
+        kept = pm_query.drop_stubs(markets)
+        self.assertEqual([m["outcome"] for m in kept], ["Philadelphia 76ers"])
+
+    def test_a_traded_market_at_fifty_percent_survives(self):
+        markets = [self.stub("Philadelphia 76ers", 0.5, 22_282.0)]
+        self.assertEqual(len(pm_query.drop_stubs(markets)), 1)
+
+    def test_an_untraded_market_with_a_real_price_survives(self):
+        """Zero volume is a credibility problem, already flagged; only the
+        untouched coin flip carries no information at all."""
+        markets = [self.stub("Utah Jazz", 0.0075, 0.0)]
+        self.assertEqual(len(pm_query.drop_stubs(markets)), 1)

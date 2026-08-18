@@ -1250,6 +1250,27 @@ def check_ladders(markets):
                 market["flags"].append(note)
 
 
+STUB_PRICE = 0.5
+
+
+def drop_stubs(markets):
+    """Remove untouched placeholder contracts.
+
+    Polymarket seeds a field with unnamed rows — "Team A", "Team B", "Other"
+    — sitting at exactly 0.5 with no volume. Once a named field is ordered by
+    probability, those stubs print above the real 23% favourite. A market
+    nobody has traded, still at the seeded coin flip, holds no view at all.
+    """
+    kept = []
+    for market in markets:
+        traded = (market.get("volume_usd") or market.get("volume_24h_usd")
+                  or market.get("volume_7d_usd") or market.get("volume_mana"))
+        if not traded and market.get("probability") == STUB_PRICE:
+            continue
+        kept.append(market)
+    return kept
+
+
 def drop_unpriced(markets):
     """No number, no answer. Multi-outcome Manifold markets and Metaculus
     pages we failed to read land here."""
@@ -1308,7 +1329,19 @@ def keyword_numbers(keywords):
 
 
 DISTRIBUTION_MIN = 0.97
-DISTRIBUTION_MAX = 1.05
+# A complete futures board runs a few points over 100% on the spread alone,
+# so the ceiling has to sit above ordinary margin.
+DISTRIBUTION_MAX = 1.12
+# Past this, whatever the field is, it is not one-winner.
+DISTRIBUTION_CEILING = 1.5
+
+# Fields where several outcomes win at once: sixteen teams make the playoffs,
+# so thirty "will they make it" markets are supposed to sum near 1600%.
+# "seats" is deliberately absent: "How many seats will they hold?" is a
+# proper distribution over mutually exclusive counts, not a multi-winner field.
+MULTI_WINNER_MARKS = ("playoff", "qualify", "advance", "make the", "reach the",
+                      "nominat", "shortlist", "top 4", "top four", "medal",
+                      "relegat", "promot")
 
 
 def check_distribution(markets):
@@ -1333,18 +1366,24 @@ def check_distribution(markets):
         if len(rungs) < 4:
             continue
         parts = [_ladder_parts(m) for m in rungs]
-        titles = {m.get("event_title") or m.get("title") for m in rungs}
-        if any(p and _expected_direction(p[0], next(iter(titles))) for p in parts):
+        title = (rungs[0].get("event_title") or rungs[0].get("title") or "")
+        if any(p and _expected_direction(p[0], title) for p in parts):
             continue  # thresholds, not alternatives
+        if any(mark in title.lower() for mark in MULTI_WINNER_MARKS):
+            continue  # several outcomes win at once; the sum means nothing
         total = sum(m["probability"] for m in rungs)
+        if total >= DISTRIBUTION_CEILING:
+            continue  # not a one-winner board, whatever it is
         note = None
         if total < DISTRIBUTION_MIN:
             note = (f"⚠️ Distribution incomplete: the {len(rungs)} outcomes returned sum "
                     f"to {total:.0%}, so {1 - total:.0%} of the probability sits on "
-                    f"outcomes not shown — do not read these as the whole field")
+                    f"outcomes the venue did not return — do not read these as the "
+                    f"whole field, and do not expect another page to reveal them")
         elif total > DISTRIBUTION_MAX:
-            note = (f"⚠️ Distribution incoherent: {len(rungs)} mutually exclusive outcomes "
-                    f"sum to {total:.0%} — these quotes contradict each other")
+            note = (f"⚠️ Distribution incoherent: {len(rungs)} outcomes sum to {total:.0%} "
+                    f"— either the quotes contradict each other or these outcomes are "
+                    f"not actually mutually exclusive")
         if not note:
             continue
         for market in rungs:
@@ -1434,7 +1473,7 @@ def run_search(keywords, sources, limit=8, show_dropped=False,
             except Exception as exc:
                 errors.setdefault(source, f"{type(exc).__name__}: {exc}")
 
-    priced = drop_unpriced(results)
+    priced = drop_stubs(drop_unpriced(results))
     relevant = filter_relevant(priced, keywords)
     relevant_ids = {(m["source"], m["id"]) for m in relevant}
     dropped = [m for m in priced if (m["source"], m["id"]) not in relevant_ids]
@@ -1492,7 +1531,9 @@ def run_search(keywords, sources, limit=8, show_dropped=False,
             # same event can match 18 rungs on one query and 3 on another,
             # so this cannot prove a ladder came back whole.
             "outcomes_matched": len(grouped[key]),
-            "outcomes_sum": round(sum(m["probability"] for m in grouped[key]
+            # Sum what was returned, so this and the distribution flag speak
+            # about the same set of rows.
+            "outcomes_sum": round(sum(m["probability"] for m in grouped[key][:max_outcomes]
                                       if m.get("probability") is not None), 4),
             "possibly_truncated": len(grouped[key]) > max_outcomes,
             "url": grouped[key][0].get("url"),
