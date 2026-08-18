@@ -70,6 +70,18 @@ Read `rules` and confirm it resolves on the thing the user actually asked about.
 If the closest market answers a *related but different* question, say that
 explicitly rather than quietly substituting it.
 
+**A candidate surviving the search is not evidence that a market exists.** The
+relevance gate is deliberately a little loose so it does not hide real markets,
+so a thin coincidence gets through now and then — a question about your
+daughter's college application can surface a football game against the same
+university, and one about your own company can surface a market whose listed
+outcome merely ends in "Company". Each candidate carries `matched`, the words it
+matched on; when that is one or two incidental words, be suspicious.
+
+If every candidate fails this check, the answer is **no market**, exactly as if
+the search had come back empty. Do not soften it into "here is a related
+market's number".
+
 ### 4. Pull detail on the market you picked
 
 `detail` adds the 30-day probability history, holder counts, order-book depth,

@@ -656,3 +656,49 @@ class RankingTest(unittest.TestCase):
         deep = self.market("B", ["meta", "platform"], 9_000_000.0)
         ranked = sorted([thin, deep], key=pm_query.rank_key)
         self.assertEqual(ranked[0]["title"], "B")
+
+
+class SingleWordLeakTest(unittest.TestCase):
+    """Rescuing one-word matches on word length let any proper noun match
+    anything containing it: "will my daughter get into Stanford" matched a
+    Stanford football game, and "will I get promoted" matched a GiveWell
+    grant for breastfeeding promotion.
+
+    The good one-word matches ("Meta", "recession") are the ones where that
+    word IS the whole question. The bad ones leave the half of the question
+    that makes it personal unmatched.
+    """
+
+    def market(self, title):
+        return {"source": "polymarket", "id": title, "title": title,
+                "outcome": "Yes", "probability": 0.5}
+
+    def test_proper_noun_alone_does_not_match_an_unrelated_event(self):
+        kept = pm_query.filter_relevant([self.market("Hawai'i vs Stanford")],
+                                        ["will my daughter get into Stanford"])
+        self.assertEqual(kept, [])
+
+    def test_a_different_sense_of_the_same_word_does_not_match(self):
+        kept = pm_query.filter_relevant(
+            [self.market("Will GiveWell recommend a grant to support breastfeeding promotion?")],
+            ["will I get promoted next year at my job"])
+        self.assertEqual(kept, [])
+
+    def test_generic_industry_market_does_not_answer_a_personal_one(self):
+        kept = pm_query.filter_relevant(
+            [self.market("Which companies will be acquired this year?")],
+            ["will my company be acquired next year"])
+        self.assertEqual(kept, [])
+
+    def test_one_word_questions_still_match_on_that_word(self):
+        for title, query in [("Recession this year?", "US recession 2026"),
+                             ("Meta (META) Up or Down on August 19?", "Meta stock price"),
+                             ("Will Bitcoin close above 150,000?", "Bitcoin price 150k")]:
+            self.assertEqual(len(pm_query.filter_relevant([self.market(title)], [query])), 1,
+                             f"{query!r} should still match {title!r}")
+
+    def test_amounts_and_years_are_not_content_words(self):
+        """`150k` and `2026` discriminate nothing and would otherwise be the
+        second match that lets an unrelated market through."""
+        for token in ("150k", "2026", "25bps"):
+            self.assertNotIn(token, pm_query.content_tokens(f"price {token}"))

@@ -685,7 +685,6 @@ TOKEN_RE = re.compile(r"[a-z0-9]+")
 SUFFIXES = ("ments", "ment", "tions", "tion", "sions", "sion", "ances",
             "ance", "ences", "ence", "ings", "ing", "ed")
 MIN_STEM = 3
-DISTINCTIVE_WORD = 6
 
 
 def stem(token):
@@ -702,7 +701,10 @@ def stem(token):
 
 def _content_pairs(text):
     for token in TOKEN_RE.findall((text or "").lower()):
-        if token in STOPWORDS or token.isdigit() or len(token) < 2:
+        # Amounts, years and tickers-with-digits ("150k", "2026", "25bps")
+        # discriminate nothing, and letting one count as a match is how an
+        # unrelated market clears a two-word bar.
+        if token in STOPWORDS or token[0].isdigit() or len(token) < 2:
             continue
         yield stem(token), len(token)
 
@@ -754,9 +756,12 @@ def filter_relevant(markets, keywords):
             # "2Y US Treasury yield today?" shares `us` and nothing that
             # matters. Ask for two, unless the single word carries the
             # question by itself, or the group only has one word to give.
+            # Two matches, unless the group has only one word to give. A
+            # single match out of several leaves the part of the question
+            # that makes it specific unaccounted for — that is how a
+            # Stanford football game answered a college-admissions question.
             needed = min(2, len(weights))
-            distinctive = any(weights[t] >= DISTINCTIVE_WORD for t in matched)
-            if len(matched) >= needed or distinctive:
+            if len(matched) >= needed:
                 if best is None or len(matched) > len(best):
                     best = matched
         if best is not None:
