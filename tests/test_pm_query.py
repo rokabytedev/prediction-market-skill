@@ -1178,3 +1178,133 @@ class UniversalDisplayTitleTest(unittest.TestCase):
     def test_manifold_candidates_are_self_describing(self):
         for m in pm_query.parse_manifold_search(load("manifold_search.json")):
             self.assertTrue(m.get("display_title"))
+
+
+# ==========================================================================
+# Fourth round: defects found re-testing the Bitcoin ladder (2026-08-18).
+# ==========================================================================
+
+
+class SpotSymbolTest(unittest.TestCase):
+    """`spot BTC` returns $28.57 — Grayscale's Bitcoin Mini Trust ETF — while
+    Bitcoin trades at $64,685. SKILL.md's only example was `spot META`, so
+    following it anchors a $150k ladder to a $28 share price with no warning.
+    The anchor step exists precisely to stop the ladder being misread."""
+
+    def test_bare_crypto_tickers_resolve_to_the_coin(self):
+        for symbol in ("BTC", "btc", "ETH", "SOL", "DOGE"):
+            self.assertTrue(pm_query.resolve_symbol(symbol).endswith("-USD"),
+                            f"{symbol} should resolve to the coin, not an ETF")
+
+    def test_equities_are_left_alone(self):
+        for symbol in ("META", "TSLA", "AAPL", "SPY"):
+            self.assertEqual(pm_query.resolve_symbol(symbol), symbol.upper())
+
+    def test_an_explicit_pair_is_respected(self):
+        self.assertEqual(pm_query.resolve_symbol("BTC-USD"), "BTC-USD")
+
+    def test_quote_names_the_instrument_it_priced(self):
+        quote = pm_query.parse_spot(load("yahoo_quote_meta.json"))
+        self.assertIn("name", quote)
+        self.assertIn("instrument_type", quote)
+
+
+class SuffixedThresholdTest(unittest.TestCase):
+    """"1M+" parsed as the number 1, so a MicroStrategy market about how many
+    coins it holds was compared against a Bitcoin price ladder and produced a
+    cross-market warning — which SKILL.md then requires be shown to the user."""
+
+    def test_magnitude_suffixes_are_scaled(self):
+        self.assertEqual(pm_query._ladder_parts({"outcome": "1M+"})[1], 1_000_000.0)
+        self.assertEqual(pm_query._ladder_parts({"outcome": "↑ 150k"})[1], 150_000.0)
+
+    def test_plain_numbers_are_unaffected(self):
+        self.assertEqual(pm_query._ladder_parts({"outcome": "↑ 90,000"})[1], 90_000.0)
+
+
+class UnderlyingIdentityTest(unittest.TestCase):
+    """A market about MicroStrategy's coin holdings shares the word "bitcoin"
+    with a Bitcoin price ladder, and one shared word was being taken as
+    "same underlying"."""
+
+    def test_a_company_holding_the_asset_is_not_the_asset(self):
+        a = ("tokens", frozenset({"bitcoin"}))
+        b = ("tokens", frozenset({"microstrategy", "announc", "hold", "bitcoin"}))
+        self.assertFalse(pm_query._same_underlying(a, b))
+
+    def test_the_same_subject_still_matches(self):
+        a = ("tokens", frozenset({"bitcoin"}))
+        b = ("tokens", frozenset({"bitcoin"}))
+        self.assertTrue(pm_query._same_underlying(a, b))
+
+    def test_one_extra_qualifier_is_tolerated(self):
+        a = ("tokens", frozenset({"bitcoin"}))
+        b = ("tokens", frozenset({"bitcoin", "spot"}))
+        self.assertTrue(pm_query._same_underlying(a, b))
+
+
+class SameLevelAcrossEventsTest(unittest.TestCase):
+    """Two Polymarket markets, same level, same deadline: the ladder rung
+    ↑150,000 printed 2.5% while the standalone "hit $150k by December 31,
+    2026" printed 1.25%. Both over a million dollars of volume, twice apart,
+    and nothing said so — the standalone market keeps its level in the title,
+    where no check was looking."""
+
+    def touch(self, title, outcome, p):
+        m = pm_query.blank_market("polymarket")
+        m.update({"id": title + outcome, "title": title, "event_title": title,
+                  "event_id": title, "outcome": outcome, "probability": p,
+                  "end_date": "2026-12-31T00:00:00Z",
+                  "rules": "resolves Yes if reached at any point"})
+        return m
+
+    def test_same_level_priced_twice_apart_is_flagged(self):
+        markets = [self.touch("What price will Bitcoin hit in 2026?", "↑ 150,000", 0.025),
+                   self.touch("Will Bitcoin hit $150k by December 31, 2026?",
+                              "by December 31, 2026", 0.0125)]
+        pm_query.check_same_level(markets)
+        self.assertTrue([f for m in markets for f in m["flags"] if "same level" in f.lower()])
+
+    def test_close_prices_on_the_same_level_are_silent(self):
+        markets = [self.touch("What price will Bitcoin hit in 2026?", "↑ 150,000", 0.025),
+                   self.touch("Will Bitcoin hit $150k by December 31, 2026?",
+                              "by December 31, 2026", 0.024)]
+        pm_query.check_same_level(markets)
+        self.assertEqual([f for m in markets for f in m["flags"] if "same level" in f.lower()], [])
+
+    def test_different_levels_are_not_compared(self):
+        markets = [self.touch("What price will Bitcoin hit in 2026?", "↑ 170,000", 0.0215),
+                   self.touch("Will Bitcoin hit $150k by December 31, 2026?",
+                              "by December 31, 2026", 0.0125)]
+        pm_query.check_same_level(markets)
+        self.assertEqual([f for m in markets for f in m["flags"] if "same level" in f.lower()], [])
+
+
+class DateIsNotALevelTest(unittest.TestCase):
+    """"by December 31, 2026" parsed as the threshold 31, so a market whose
+    level lives in its title was compared against a price ladder as though
+    it were a $31 rung — producing eight cross-market warnings at once, all
+    of which SKILL.md would force into the answer."""
+
+    def market(self, title, outcome, p):
+        m = pm_query.blank_market("polymarket")
+        m.update({"id": title + outcome, "title": title, "event_title": title,
+                  "event_id": title, "outcome": outcome, "probability": p,
+                  "end_date": "2026-12-31T00:00:00Z",
+                  "rules": "resolves Yes if reached at any point"})
+        return m
+
+    def test_a_date_label_is_not_treated_as_a_threshold(self):
+        markets = [self.market("What price will Bitcoin hit in 2026?", "↑ 90,000", 0.125),
+                   self.market("When will Bitcoin hit $150k?", "by December 31, 2026", 0.012)]
+        pm_query.check_cross_event_thresholds(markets)
+        self.assertEqual([f for m in markets for f in m["flags"]
+                          if "cross-market" in f.lower()], [],
+                         "a date must not be compared against a price rung")
+
+    def test_a_genuine_cross_event_inversion_still_fires(self):
+        markets = [self.market("What price will Bitcoin hit in 2026?", "↑ 200,000", 0.018),
+                   self.market("When will Bitcoin hit $150k?", "by December 31, 2026", 0.012)]
+        pm_query.check_cross_event_thresholds(markets)
+        self.assertTrue([f for m in markets for f in m["flags"] if "cross-market" in f.lower()],
+                        "touching 200k cannot be likelier than touching 150k")

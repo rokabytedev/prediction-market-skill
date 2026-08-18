@@ -20,6 +20,7 @@ python3 scripts/pm_query.py detail polymarket <conditionId>
 python3 scripts/pm_query.py detail kalshi <ticker>
 python3 scripts/pm_query.py compare kalshi:<ticker> polymarket:<conditionId>
 python3 scripts/pm_query.py spot META          # underlying price, to anchor a ladder
+python3 scripts/pm_query.py spot BTC           # crypto resolves to the coin, not an ETF
 ```
 
 Stdlib Python only — no install step. Paths are relative to this skill directory.
@@ -58,9 +59,10 @@ only a generic word with the question are filtered out.
 `verdict` is `found`, `no_live_market`, or `sources_unavailable` — the last
 means nothing could be queried, which is not the same as nothing existing.
 
-Coverage is capped at `--limit` events per venue (default 8). When more
-matched, `limit_note` and `events_not_returned` say so; raise `--limit` rather
-than assuming you saw everything. `--show-dropped` adds `dropped_examples`,
+Coverage is capped two ways: `--limit` events per venue (default 8) and
+`--max-outcomes` per event (default 20). `--limit` does **not** widen a
+truncated ladder — that needs `--max-outcomes`. `limit_note`,
+`events_not_returned` and `possibly_truncated` say when either bit. `--show-dropped` adds `dropped_examples`,
 the markets the relevance gate rejected. Check both before concluding a market
 does not exist.
 
@@ -119,6 +121,18 @@ another manufactures a meaningless 70-point "disagreement".
 different thresholds. A rung reading 52 percent is meaningless until you know
 where the price is now, so run `spot TICKER` first and lead with it.
 
+**Check the `name` the quote came back with.** Bare crypto tickers resolve to
+equities on the data source — `BTC` is an ETF trading near $28, not Bitcoin
+near $65,000 — so the script maps known coins to their pair form and says so
+in `note`. For anything it does not know, `name` and `instrument_type` are
+there to be read: a ladder about a coin anchored to something labelled ETF is
+the wrong anchor.
+
+Put the level in one of your keyword groups ("Bitcoin 150k"). Venue search is
+sensitive to it — the most on-point markets often surface only when the number
+is present — and a number in the question also protects that rung from the
+per-event cap.
+
 Report the ladder as a ladder: several rungs in order, so the reader sees the
 distribution. Do not truncate it to three rows — the shape is the answer. Say
 whether the rungs are *touch* (any point intraday) or *close* levels; they price
@@ -136,6 +150,9 @@ is about:
   across two events, e.g. touching 170k dearer than touching 150k.
 - **Window inconsistent** — a shorter window priced above a longer one that
   contains it.
+- **Same level priced twice** — one venue quoting the same level and deadline
+  two different ways, e.g. a ladder rung at 2.5% beside a standalone market at
+  1.2%. At least one is wrong; report the range, not one of the numbers.
 - **Distribution incomplete / incoherent** — mutually exclusive outcomes that
   sum to well under 100% (some are missing) or above it (the quotes contradict
   each other). This fires on any field of alternatives, prices and names alike.
@@ -156,6 +173,7 @@ or flags to hit a word count.
 
 · Trend: -1pt over the week; down from 15.5% a month ago
 · Size: 1.7M USD lifetime volume, 42k USD resting, 975 wallets holding → credible
+  (Kalshi publishes no resting depth — quote open interest there instead)
 · Resolves: NBER declares a recession, or two consecutive quarters of negative real GDP
 · Cross-check: Kalshi 6%, Manifold (play money) 8.5% — all three agree
 · https://polymarket.com/event/us-recession-by-end-of-2026
