@@ -64,9 +64,10 @@ than assuming you saw everything. `--show-dropped` adds `dropped_examples`,
 the markets the relevance gate rejected. Check both before concluding a market
 does not exist.
 
-Quote `display_title`, not `title`: in search output every rung of an event
+Quote `display_title`, not `title`: in search output every row of an event
 shares the event's title, so "What will META hit in August 2026?" plus 50.5%
-does not say whether that is a rise or a fall.
+does not say whether that is a rise or a fall, and "Nobel Peace Prize winner"
+plus 30% names nobody. `display_title` folds in the row's own `outcome`.
 
 ### 3. Check the resolution criteria before believing a match
 
@@ -105,9 +106,10 @@ the full resolution text and a `fetched_at` timestamp. Run it before writing the
 answer — search results carry no resolution text and no trend.
 
 Comparing venues? Use `compare`, and only on markets you have confirmed ask the
-same question. It returns `spread_pp`, `agree` (within five points), and
-`caveats` — mismatched deadlines and missing resolution text, the two things
-that make a spread meaningless. The script deliberately refuses to compute a cross-venue spread
+same question. It returns `spread_pp`, `agree`, and `caveats`. **`agree` is `null` when
+agreement could not be verified** — a missing end date, missing rules, or two
+sides resolving on different events (confirming an IPO is not completing one).
+Null is not agreement; report the spread and the caveat, not a match. The script deliberately refuses to compute a cross-venue spread
 during search, because comparing "Cut 25bps" on one venue against "No change" on
 another manufactures a meaningless 70-point "disagreement".
 
@@ -134,8 +136,11 @@ is about:
   across two events, e.g. touching 170k dearer than touching 150k.
 - **Window inconsistent** — a shorter window priced above a longer one that
   contains it.
-- **Distribution incomplete** — mutually exclusive buckets that sum to well
-  under 100%, meaning outcomes are missing and the ladder cannot be integrated.
+- **Distribution incomplete / incoherent** — mutually exclusive outcomes that
+  sum to well under 100% (some are missing) or above it (the quotes contradict
+  each other). This fires on any field of alternatives, prices and names alike.
+- **End date already passed** — the market is past its date and may be awaiting
+  settlement rather than showing a live view.
 
 A flag makes those rungs indicative at best. Say which rungs it applies to
 rather than discrediting the whole answer.
@@ -168,10 +173,18 @@ Rules for that block:
   without it — every flag the script returns must appear in your answer.
 - Report the probability as the market's view, never as yours. "The market
   prices this at 73%", not "there is a 73% chance".
-- Multi-outcome events (who wins X): list the top three outcomes with prices.
+- **Multi-outcome events (who wins X): lead with the field's sum, not with a
+  name.** The `events` index carries `outcomes_sum`. When it is far below 100%
+  the rest of the probability sits on outcomes you were never shown, so "the
+  favourite is X at 8.5%" is false — X is only the highest of what came back.
+  Say how much is unaccounted for, then give the top few **by probability**
+  (the script now orders them that way). When the sum is above 100% the quotes
+  contradict each other and none of them is worth much.
   Ladders are different — show the rungs in order, per step 5.
 - A price under 2% is flagged "priced as a long shot", not settled. On a ladder
   tail that is ordinary, so report it as the market's view of a remote outcome.
+- `possibly_truncated` on an event means it filled the per-event cap, so there
+  are probably more outcomes than you can see. Raise `--limit` or say so.
 - Manifold is play money and Metaculus is not a market — label both, and never
   lead with them when a real-money venue has the same question.
 - Give the market link on its own line, plain text.
@@ -179,7 +192,13 @@ Rules for that block:
 ### 7. Multi-part questions
 
 "Will it fall, and how far?" is two questions. Answer them separately and say
-which part the market actually covers. It is common for the level question to
+which part the market actually covers.
+
+Watch for the two parts resolving on **different events**. A "when will X IPO"
+ladder can resolve on the company *announcing* an offering while the "will X
+IPO by date" market resolves on it *completing* one — months apart, and not
+comparable. Report them as separate answers; never present one as the other's
+cross-check. It is common for the level question to
 have a ladder while the direction question has only a thin daily up/down market,
 or for the near term to be priced and the horizon the user asked about to have
 no market at all. Say so plainly instead of stretching one answer over both.

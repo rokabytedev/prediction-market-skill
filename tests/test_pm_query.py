@@ -878,13 +878,14 @@ class ExactCountLadderTest(unittest.TestCase):
         markets = self.rungs("How many Senate seats will Democrats hold?",
                              [("48", 0.25), ("49", 0.25), ("50", 0.25), ("51", 0.26)])
         pm_query.check_ladders(markets)
+        pm_query.check_distribution(markets)
         self.assertEqual([f for m in markets for f in m["flags"]], [])
 
     def test_a_partial_distribution_says_so(self):
         """Buckets that sum to two thirds look exactly like a complete set."""
         markets = self.rungs("How many Senate seats will Democrats hold?",
                              [("45", 0.019), ("46", 0.031), ("47", 0.068), ("48", 0.11)])
-        pm_query.check_ladders(markets)
+        pm_query.check_distribution(markets)
         self.assertTrue([f for m in markets for f in m["flags"] if "incomplete" in f.lower()])
 
     def test_threshold_ladder_without_arrows_is_still_checked(self):
@@ -1027,12 +1028,30 @@ class CompareOutputTest(unittest.TestCase):
     subcommand exists for stayed with the model."""
 
     def test_reports_the_spread_and_whether_they_agree(self):
+        rules = "resolves Yes if the party completes a Senate majority"
         summary = pm_query.compare_summary([
-            {"source": "polymarket", "probability": 0.515, "end_date": "2026-11-03T00:00:00Z"},
-            {"source": "kalshi", "probability": 0.49, "end_date": "2026-11-03T00:00:00Z"},
+            {"source": "polymarket", "probability": 0.515, "rules": rules,
+             "end_date": "2026-11-03T00:00:00Z"},
+            {"source": "kalshi", "probability": 0.49, "rules": rules,
+             "end_date": "2026-11-03T00:00:00Z"},
         ])
         self.assertAlmostEqual(summary["spread_pp"], 2.5, places=1)
         self.assertTrue(summary["agree"])
+
+    def test_refuses_to_claim_agreement_it_could_not_verify(self):
+        """Two markets three points apart were called agreement when one
+        resolved on a company confirming an IPO and the other on completing
+        one — and the deadline check had silently skipped, because one side
+        reported no end date at all."""
+        summary = pm_query.compare_summary([
+            {"source": "polymarket", "probability": 0.22, "end_date": None,
+             "rules": "resolves Yes if OpenAI completes an Initial Public Offering"},
+            {"source": "kalshi", "probability": 0.25, "end_date": "2027-01-01T00:00:00Z",
+             "rules": "resolves Yes if OpenAI confirms an IPO before Jan 1, 2027"},
+        ])
+        self.assertIsNone(summary["agree"])
+        self.assertTrue([c for c in summary["caveats"] if "resolution differs" in c.lower()])
+        self.assertTrue([c for c in summary["caveats"] if "end date" in c.lower()])
 
     def test_flags_a_wide_gap(self):
         summary = pm_query.compare_summary([
@@ -1060,3 +1079,102 @@ class LongShotWordingTest(unittest.TestCase):
              "volume_24h_usd": 25_000.0, "liquidity_usd": 200_000.0})
         self.assertTrue(any("long shot" in f.lower() for f in flags))
         self.assertFalse(any("settled" in f.lower() for f in flags))
+
+
+# ==========================================================================
+# Third round: a "who wins" field with named outcomes — the shape none of
+# the price-ladder and binary tests had exercised (2026-08-18).
+# ==========================================================================
+
+
+class NamedOutcomeOrderTest(unittest.TestCase):
+    """Within one event every candidate matched the same words, so lifetime
+    volume alone decided the order: the 8.5% favourite printed last and a
+    2.45% long shot printed first. Following "list the top three outcomes"
+    against that order names the wrong three people."""
+
+    def field(self):
+        rows = [("Donald Trump", 0.0245, 4_378_740.0), ("UNRWA", 0.0425, 2_044_656.0),
+                ("Greta Thunberg", 0.011, 1_468_717.0), ("Yulia Navalnaya", 0.085, 290_687.0)]
+        out = []
+        for name, p, vol in rows:
+            m = pm_query.blank_market("polymarket")
+            m.update({"id": name, "title": "Nobel Peace Prize Winner 2026",
+                      "event_title": "Nobel Peace Prize Winner 2026", "outcome": name,
+                      "probability": p, "volume_usd": vol})
+            out.append(m)
+        return out
+
+    def test_named_field_is_ordered_by_probability(self):
+        ordered = pm_query.order_rungs(self.field())
+        self.assertEqual(ordered[0]["outcome"], "Yulia Navalnaya")
+        self.assertEqual([m["outcome"] for m in ordered][:2], ["Yulia Navalnaya", "UNRWA"])
+
+    def test_threshold_ladders_keep_threshold_order(self):
+        rungs = []
+        for label, p in [("↓ $540", 0.875), ("↓ $460", 0.02), ("↓ $500", 0.14)]:
+            m = pm_query.blank_market("polymarket")
+            m.update({"id": label, "title": "hit in August", "event_title": "hit in August",
+                      "outcome": label, "probability": p, "volume_usd": 1000.0})
+            rungs.append(m)
+        ordered = pm_query.order_rungs(rungs)
+        self.assertEqual([m["outcome"] for m in ordered], ["↓ $460", "↓ $500", "↓ $540"])
+
+
+class DistributionSumTest(unittest.TestCase):
+    """Twenty Polymarket candidates summed to 36% — two thirds of the
+    probability sat on names never returned — and eighteen Kalshi candidates
+    summed to 119%, which no set of coherent prices can do. Neither was
+    mentioned, because the sum check only ran on labels containing a digit."""
+
+    def field(self, probs, source="polymarket"):
+        out = []
+        for i, p in enumerate(probs):
+            m = pm_query.blank_market(source)
+            m.update({"id": f"c{i}", "title": "Nobel Peace Prize Winner 2026",
+                      "event_title": "Nobel Peace Prize Winner 2026",
+                      "outcome": f"Candidate {chr(65 + i)}", "probability": p})
+            out.append(m)
+        return out
+
+    def test_named_field_missing_most_of_its_mass_is_flagged(self):
+        markets = self.field([0.085, 0.054, 0.0425, 0.0245, 0.011])
+        pm_query.check_distribution(markets)
+        self.assertTrue([f for m in markets for f in m["flags"] if "incomplete" in f.lower()])
+
+    def test_named_field_summing_over_one_is_flagged(self):
+        markets = self.field([0.30, 0.15, 0.12, 0.32, 0.30])
+        pm_query.check_distribution(markets)
+        self.assertTrue([f for m in markets for f in m["flags"] if "incoheren" in f.lower()])
+
+    def test_a_coherent_field_is_silent(self):
+        markets = self.field([0.4, 0.3, 0.2, 0.08])
+        pm_query.check_distribution(markets)
+        self.assertEqual([f for m in markets for f in m["flags"]], [])
+
+    def test_touch_ladders_are_exempt(self):
+        """Touching 540 and touching 520 are not alternatives, so those
+        probabilities are supposed to sum past 100%."""
+        markets = []
+        for label, p in [("↓ $540", 0.875), ("↓ $520", 0.505), ("↓ $500", 0.14), ("↓ $480", 0.05)]:
+            m = pm_query.blank_market("polymarket")
+            m.update({"id": label, "title": "hit in August", "event_title": "hit in August",
+                      "outcome": label, "probability": p})
+            markets.append(m)
+        pm_query.check_distribution(markets)
+        self.assertEqual([f for m in markets for f in m["flags"]], [])
+
+
+class UniversalDisplayTitleTest(unittest.TestCase):
+    """SKILL.md says to quote display_title. Kalshi and Manifold candidates
+    did not have one, and their `title` is the event name repeated on every
+    row — "Nobel Peace Prize winner — 30%" with no candidate named."""
+
+    def test_kalshi_candidates_are_self_describing(self):
+        markets = pm_query.parse_kalshi_v2_markets(load("kalshi_markets_new_fields.json"))
+        for m in markets:
+            self.assertTrue(m.get("display_title"))
+
+    def test_manifold_candidates_are_self_describing(self):
+        for m in pm_query.parse_manifold_search(load("manifold_search.json")):
+            self.assertTrue(m.get("display_title"))

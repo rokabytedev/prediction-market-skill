@@ -90,6 +90,7 @@ def blank_market(source):
         "volume_usd": None,
         "volume_24h_usd": None,
         "volume_7d_usd": None,
+        "event_id": None,
         "event_volume_24h_usd": None,
         "liquidity_usd": None,
         "open_interest_usd": None,
@@ -170,6 +171,10 @@ def credibility_flags(market):
               or market.get("event_volume_24h_usd"))
     if not recent:
         flags.append("⚠️ No recent trading — the price may be stale")
+
+    if market.get("end_date_passed"):
+        flags.append(f"⚠️ End date already passed ({str(market.get('end_date'))[:10]}) "
+                     f"— this may be awaiting settlement, not a live view")
 
     prob = market.get("probability")
     if prob is not None and (prob < NEAR_CERTAIN or prob > 1 - NEAR_CERTAIN):
@@ -260,6 +265,7 @@ def parse_polymarket_event(event):
             "url": _poly_url(event_slug, raw.get("slug")),
             "rules": raw.get("description") or event.get("description"),
             "event_title": event.get("title"),
+            "event_id": str(event.get("id") or event.get("slug") or event.get("title") or ""),
             "clob_token_id": (json.loads(raw["clobTokenIds"])[0]
                               if isinstance(raw.get("clobTokenIds"), str) and raw["clobTokenIds"]
                               else None),
@@ -374,6 +380,9 @@ def detail_polymarket(condition_id):
         return market
 
     market = markets[0]
+    if not market.get("end_date"):
+        market["end_date"] = (raw_market.get("endDate")
+                              or (raw_market.get("events") or [{}])[0].get("endDate"))
     try:
         holders_raw = http_json(
             f"{POLY_DATA}/holders?market={urllib.parse.quote(condition_id)}&limit={limit}")
@@ -456,10 +465,12 @@ def parse_kalshi_v2_markets(raw):
             "open_interest_usd": as_float(m.get("open_interest_fp")),
             "participants_label": "open interest (Kalshi publishes no trader count)",
             "end_date": end,
+            "event_id": m.get("event_ticker"),
             "end_date_passed": bool(parsed_end and parsed_end < now_utc()),
             "url": _kalshi_url(m.get("ticker")),
             "rules": _usable_rules(m.get("rules_primary")),
         })
+        market["display_title"] = _display_title(market)
         label_outcomes(market, ["Yes", "No"],
                        [prob, (1 - prob) if prob is not None else None])
         finalize(market)
@@ -506,8 +517,10 @@ def parse_kalshi_search(raw):
                 "event_volume_24h_usd": as_float(entry.get("recent_volume")),
                 "participants_label": "open interest (Kalshi publishes no trader count)",
                 "end_date": end,
+                "event_id": entry.get("event_ticker") or entry.get("series_ticker"),
                 "url": _kalshi_url(entry.get("series_ticker") or ticker),
             })
+            market["display_title"] = _display_title(market)
             label_outcomes(market, ["Yes", "No"],
                            [prob, (1 - prob) if prob is not None else None])
             out.append(finalize(market))
@@ -593,6 +606,7 @@ def parse_manifold_search(raw):
             # Mana, not dollars — deliberately not written into volume_usd.
             "volume_mana": as_float(m.get("volume")),
         })
+        market["display_title"] = _display_title(market)
         label_outcomes(market, ["Yes", "No"],
                        [prob, (1 - prob) if prob is not None else None])
         out.append(finalize(market))
@@ -1083,15 +1097,6 @@ def check_ladders(markets):
     for (_, title, shape), rungs in groups.items():
         direction = _expected_direction(shape, title)
         if direction is None:
-            # Mutually exclusive buckets: not monotone, but they must add up.
-            # A ladder returned in part looks exactly like a complete one.
-            total = sum(m["probability"] for _, m in rungs)
-            if len(rungs) >= 4 and total < 0.97:
-                note = (f"⚠️ Distribution incomplete: the {len(rungs)} buckets returned "
-                        f"sum to {total:.0%} — some outcomes are missing")
-                for _, market in rungs:
-                    if note not in market["flags"]:
-                        market["flags"].append(note)
             continue
         if len(rungs) < LADDER_MIN_RUNGS:
             continue
@@ -1173,6 +1178,51 @@ def keyword_numbers(keywords):
     return found
 
 
+DISTRIBUTION_MIN = 0.97
+DISTRIBUTION_MAX = 1.05
+
+
+def check_distribution(markets):
+    """Mutually exclusive fields must add up. Mutates `markets`.
+
+    Twenty Polymarket Nobel candidates summed to 36% — two thirds of the
+    probability sat on names never returned — and eighteen Kalshi candidates
+    summed to 119%, which no coherent set of prices can do. Neither was
+    mentioned, because the old check lived behind a regex that required a
+    digit in the label and so never saw a field of people's names.
+
+    Touch ladders are exempt: touching 540 and touching 520 are not
+    alternatives, so they are supposed to sum past 100%.
+    """
+    groups = {}
+    for market in markets:
+        if market.get("probability") is None:
+            continue
+        groups.setdefault(_event_key(market), []).append(market)
+
+    for rungs in groups.values():
+        if len(rungs) < 4:
+            continue
+        parts = [_ladder_parts(m) for m in rungs]
+        titles = {m.get("event_title") or m.get("title") for m in rungs}
+        if any(p and _expected_direction(p[0], next(iter(titles))) for p in parts):
+            continue  # thresholds, not alternatives
+        total = sum(m["probability"] for m in rungs)
+        note = None
+        if total < DISTRIBUTION_MIN:
+            note = (f"⚠️ Distribution incomplete: the {len(rungs)} outcomes returned sum "
+                    f"to {total:.0%}, so {1 - total:.0%} of the probability sits on "
+                    f"outcomes not shown — do not read these as the whole field")
+        elif total > DISTRIBUTION_MAX:
+            note = (f"⚠️ Distribution incoherent: {len(rungs)} mutually exclusive outcomes "
+                    f"sum to {total:.0%} — these quotes contradict each other")
+        if not note:
+            continue
+        for market in rungs:
+            if note not in market["flags"]:
+                market["flags"].append(note)
+
+
 def order_rungs(markets):
     """Keep an event's rungs together and in threshold order.
 
@@ -1194,6 +1244,11 @@ def order_rungs(markets):
         parts = [(_ladder_parts(m), m) for m in rungs]
         if all(p for p, _ in parts) and len(rungs) > 2:
             rungs = [m for _, m in sorted(parts, key=lambda item: (item[0][0], item[0][1]))]
+        elif len(rungs) > 2:
+            # A field of named candidates has no natural order, so volume
+            # decided it — and printed the 8.5% favourite last, behind a
+            # 2.45% long shot with a deeper book.
+            rungs = sorted(rungs, key=lambda m: -(m.get("probability") or 0))
         out.extend(rungs)
     return out
 
@@ -1227,7 +1282,11 @@ def rank_key(market):
 
 
 def _event_key(market):
-    return (market.get("source"), market.get("event_title") or market.get("title"))
+    """Identity, not display text. Polymarket ships two distinct events both
+    titled "OpenAI IPO Closing Market Cap"; grouping by title merged them and
+    produced a completeness warning computed over half of each."""
+    return (market.get("source"),
+            market.get("event_id") or market.get("event_title") or market.get("title"))
 
 
 MAX_RUNGS_PER_EVENT = 20
@@ -1285,6 +1344,7 @@ def run_search(keywords, sources, limit=8, show_dropped=False):
         trimmed.extend(rungs[:MAX_RUNGS_PER_EVENT])
 
     check_ladders(trimmed)
+    check_distribution(trimmed)
     check_windows(trimmed)
     check_cross_event_thresholds(trimmed)
     trimmed.sort(key=lambda m: (_horizon_tier(m, trimmed),) + rank_key(m))
@@ -1294,12 +1354,16 @@ def run_search(keywords, sources, limit=8, show_dropped=False):
     payload["events"] = [
         {
             "source": key[0],
-            "title": key[1],
+            "title": (grouped[key][0].get("event_title")
+                      or grouped[key][0].get("title")),
             "outcomes_returned": len(grouped[key][:MAX_RUNGS_PER_EVENT]),
             # What this search matched, NOT the venue's outcome count — the
             # same event can match 18 rungs on one query and 3 on another,
             # so this cannot prove a ladder came back whole.
             "outcomes_matched": len(grouped[key]),
+            "outcomes_sum": round(sum(m["probability"] for m in grouped[key]
+                                      if m.get("probability") is not None), 4),
+            "possibly_truncated": len(grouped[key]) >= MAX_RUNGS_PER_EVENT,
             "url": grouped[key][0].get("url"),
         }
         for key in order if any(m in trimmed for m in grouped[key])
@@ -1307,7 +1371,9 @@ def run_search(keywords, sources, limit=8, show_dropped=False):
     if skipped:
         # Silent truncation reads as "this is everything there is".
         payload["events_not_returned"] = [
-            {"source": key[0], "title": key[1], "outcomes": len(grouped[key])}
+            {"source": key[0],
+             "title": (grouped[key][0].get("event_title") or grouped[key][0].get("title")),
+             "outcomes": len(grouped[key])}
             for key in skipped]
         payload["limit_note"] = (f"--limit {limit} events per venue; {len(skipped)} more "
                                  f"matched and were not returned. Raise --limit to see them.")
@@ -1325,6 +1391,25 @@ def run_search(keywords, sources, limit=8, show_dropped=False):
 COMPARE_SLOP_PP = 5.0
 
 
+RESOLUTION_CLASSES = {
+    "completion": ("completes", "completed", "lists", "listed", "begins trading",
+                   "closing price", "settles at"),
+    "announcement": ("announces", "announced", "confirms", "confirmed", "files",
+                     "filed", "declares"),
+}
+
+
+def _resolution_class(rules):
+    """What the market pays on. A ladder resolving when a company *confirms*
+    an IPO was compared against one resolving when it *completes* one, and
+    the tool called a three-point gap agreement."""
+    text = (rules or "").lower()
+    for name, words in RESOLUTION_CLASSES.items():
+        if any(word in text for word in words):
+            return name
+    return None
+
+
 def compare_summary(markets):
     """The spread the output template asks for, computed rather than left to
     the reader — plus the caveats that make a spread meaningless."""
@@ -1335,16 +1420,39 @@ def compare_summary(markets):
         summary["spread_pp"] = round(spread, 1)
         summary["agree"] = spread <= COMPARE_SLOP_PP
     ends = [parse_iso(m.get("end_date")) for m in markets]
-    ends = [e for e in ends if e]
-    if len(ends) >= 2 and (max(ends) - min(ends)).days > CROSS_EVENT_DAYS:
+    known_ends = [e for e in ends if e]
+    unverified = False
+    if len(known_ends) < len(markets):
+        unverified = True
         summary["caveats"].append(
-            f"Deadlines differ by {(max(ends) - min(ends)).days} days "
-            f"({min(ends).date()} vs {max(ends).date()}) — these may not be the same question")
+            "Could not compare deadlines — at least one market reported no end date")
+    elif (max(known_ends) - min(known_ends)).days > CROSS_EVENT_DAYS:
+        summary["caveats"].append(
+            f"Deadlines differ by {(max(known_ends) - min(known_ends)).days} days "
+            f"({min(known_ends).date()} vs {max(known_ends).date()}). Annual events are "
+            f"often listed with different expiry conventions, so check the rules before "
+            f"treating this as two different questions")
+
     missing = [m.get("source") for m in markets if not m.get("rules")]
     if missing:
+        unverified = True
         summary["caveats"].append(
             f"No resolution text from {', '.join(sorted(set(missing)))} — "
             f"cannot confirm both sides resolve on the same event")
+
+    verbs = {_resolution_class(m.get("rules")) for m in markets}
+    verbs.discard(None)
+    if len(verbs) > 1:
+        unverified = True
+        summary["caveats"].append(
+            f"Resolution differs: one side resolves on {' and the other on '.join(sorted(verbs))}"
+            f" — confirming an event is not the same as completing it")
+
+    if unverified:
+        # "agree" claimed on markets resolving on different events is worse
+        # than no comparison at all.
+        summary["agree"] = None
+        summary["caveats"].append("Spread reported, but agreement could not be verified")
     return summary
 
 

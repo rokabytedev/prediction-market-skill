@@ -190,5 +190,37 @@ class CompareControls(unittest.TestCase):
         self.assertIn("agree", payload)
 
 
+class NamedFieldControls(unittest.TestCase):
+    """A who-wins field: named outcomes, no numbers in the labels — the shape
+    that slipped past every numeric check and whose favourite printed last."""
+
+    def payload(self):
+        return pm_query.run_search(["Nobel", "Nobel Peace Prize"],
+                                   ["polymarket", "kalshi"], limit=3)
+
+    def test_field_is_ordered_by_probability(self):
+        payload = self.payload()
+        rows = [c for c in payload["candidates"]
+                if c["source"] == "polymarket" and "Peace" in str(c["title"])]
+        self.assertGreater(len(rows), 3, "expected a Polymarket peace-prize field")
+        probs = [r["probability"] for r in rows]
+        self.assertEqual(probs, sorted(probs, reverse=True),
+                         "the favourite must not print last")
+
+    def test_a_partial_field_says_how_much_is_missing(self):
+        payload = self.payload()
+        partial = [e for e in payload.get("events", [])
+                   if e.get("outcomes_sum") is not None and e["outcomes_sum"] < 0.9]
+        if not partial:
+            self.skipTest("no partial field on the venues right now")
+        rows = [c for c in payload["candidates"]
+                if any("Distribution" in f for f in c["flags"])]
+        self.assertTrue(rows, "a field summing under 90% must be flagged")
+
+    def test_every_candidate_is_self_describing(self):
+        for c in self.payload()["candidates"]:
+            self.assertTrue(c.get("display_title"), f"no display_title: {c['id']}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
