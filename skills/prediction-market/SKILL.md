@@ -55,8 +55,18 @@ Returns live markets only, grouped under an `events` index that tells you how
 many outcomes each event has. Settled markets are dropped, and results sharing
 only a generic word with the question are filtered out.
 
-If the result looks wrong, `--show-dropped` lists what the relevance gate
-rejected and why. Use it before concluding a market does not exist.
+`verdict` is `found`, `no_live_market`, or `sources_unavailable` — the last
+means nothing could be queried, which is not the same as nothing existing.
+
+Coverage is capped at `--limit` events per venue (default 8). When more
+matched, `limit_note` and `events_not_returned` say so; raise `--limit` rather
+than assuming you saw everything. `--show-dropped` adds `dropped_examples`,
+the markets the relevance gate rejected. Check both before concluding a market
+does not exist.
+
+Quote `display_title`, not `title`: in search output every rung of an event
+shares the event's title, so "What will META hit in August 2026?" plus 50.5%
+does not say whether that is a rise or a fall.
 
 ### 3. Check the resolution criteria before believing a match
 
@@ -67,6 +77,12 @@ titled "What will META hit in August" is not about the closing price — it
 resolves on whether any one-minute candle *touches* the level intraday.
 
 Read `rules` and confirm it resolves on the thing the user actually asked about.
+Kalshi search results carry no rules — run `detail` to get them. Manifold never
+has any, and a market flagged "no resolution text" cannot be verified at all,
+so it must not carry an answer on its own.
+
+Check the window too, not just the level: a Polymarket ladder titled "in 2026"
+can have opened in late 2025, so part of what it covers has already happened.
 If the closest market answers a *related but different* question, say that
 explicitly rather than quietly substituting it.
 
@@ -89,7 +105,9 @@ the full resolution text and a `fetched_at` timestamp. Run it before writing the
 answer — search results carry no resolution text and no trend.
 
 Comparing venues? Use `compare`, and only on markets you have confirmed ask the
-same question. The script deliberately refuses to compute a cross-venue spread
+same question. It returns `spread_pp`, `agree` (within five points), and
+`caveats` — mismatched deadlines and missing resolution text, the two things
+that make a spread meaningless. The script deliberately refuses to compute a cross-venue spread
 during search, because comparing "Cut 25bps" on one venue against "No change" on
 another manufactures a meaningless 70-point "disagreement".
 
@@ -104,13 +122,29 @@ distribution. Do not truncate it to three rows — the shape is the answer. Say
 whether the rungs are *touch* (any point intraday) or *close* levels; they price
 very differently.
 
-If the rungs contradict each other the script flags it — a "ladder inconsistent"
-warning means some rungs are unquoted stubs, not prices, and the whole ladder
-should be treated as indicative at best.
+Rungs come back grouped by event and ordered by threshold, with `↑` and `↓`
+sides kept apart. Three checks run over them, and each flag names the rungs it
+is about:
+
+- **Ladder inconsistent** — rungs within one event contradict each other. It is
+  stamped on the direction group it belongs to, so a clean `↓` side stays clean
+  while a broken `↑` side is called out. Those rungs are unquoted stubs rather
+  than prices.
+- **Cross-market inconsistency** — the same underlying priced out of order
+  across two events, e.g. touching 170k dearer than touching 150k.
+- **Window inconsistent** — a shorter window priced above a longer one that
+  contains it.
+- **Distribution incomplete** — mutually exclusive buckets that sum to well
+  under 100%, meaning outcomes are missing and the ladder cannot be integrated.
+
+A flag makes those rungs indicative at best. Say which rungs it applies to
+rather than discrediting the whole answer.
 
 ### 6. Write the answer
 
-Conclusion first, roughly 150 words, no preamble:
+Conclusion first, no preamble. Roughly 150 words for a single market; a ladder
+or a two-part question will run longer, and that is correct — never drop rungs
+or flags to hit a word count.
 
 ```
 7.5% — Polymarket: US enters recession before end of 2026 (as of 18 Aug, 11:42 PT)
@@ -136,6 +170,8 @@ Rules for that block:
   prices this at 73%", not "there is a 73% chance".
 - Multi-outcome events (who wins X): list the top three outcomes with prices.
   Ladders are different — show the rungs in order, per step 5.
+- A price under 2% is flagged "priced as a long shot", not settled. On a ladder
+  tail that is ordinary, so report it as the market's view of a remote outcome.
 - Manifold is play money and Metaculus is not a market — label both, and never
   lead with them when a real-money venue has the same question.
 - Give the market link on its own line, plain text.
@@ -184,8 +220,11 @@ The fallback is worse: responses are large, and every filter the script applies
 must then apply by hand. `references/sources.md` lists the traps.
 
 **Metaculus** is off by default. It needs the `scrapling` CLI on PATH (or
-`PREDICTION_MARKET_SCRAPLING` pointing at the binary), takes ~40s, and is
-skipped silently when unavailable. Opt in with `--sources metaculus`.
+`PREDICTION_MARKET_SCRAPLING` pointing at the binary) and takes ~40s. Add it to
+the full list — `--sources polymarket,kalshi,manifold,metaculus` — because
+`--sources` **replaces** the default rather than extending it. Passing
+`--sources metaculus` alone queries nothing else, and on a machine without
+scrapling that returns `sources_unavailable`.
 
 ## Deeper reference
 

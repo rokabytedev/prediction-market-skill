@@ -24,7 +24,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 TIMEOUT = 8
 UA = "Mozilla/5.0 (compatible; prediction-market-skill/1.0)"
@@ -137,6 +137,12 @@ def credibility_flags(market):
     flags = []
 
     if source == "manifold":
+        # Manifold ships no resolution text at all, so the workflow's
+        # verification step cannot be performed here — unlike Kalshi, where
+        # search omits the rules but `detail` supplies them.
+        if not market.get("rules"):
+            flags.append("⚠️ No resolution text available — cannot verify what "
+                         "this market resolves on")
         flags.append("⚠️ Play-money market — indicative only")
         bettors = market.get("participants")
         if bettors is not None and bettors < 20:
@@ -167,7 +173,8 @@ def credibility_flags(market):
 
     prob = market.get("probability")
     if prob is not None and (prob < NEAR_CERTAIN or prob > 1 - NEAR_CERTAIN):
-        flags.append("Market treats this as all but settled")
+        flags.append("Priced as a long shot" if prob < 0.5
+                     else "Priced as near certain")
 
     return flags
 
@@ -257,6 +264,7 @@ def parse_polymarket_event(event):
                               if isinstance(raw.get("clobTokenIds"), str) and raw["clobTokenIds"]
                               else None),
         })
+        market["display_title"] = _display_title(market)
         label_outcomes(market, _poly_labels(raw) or ["Yes", "No"], prices)
         out.append(finalize(market))
     return out
@@ -265,15 +273,42 @@ def parse_polymarket_event(event):
 def changes_from_history(history):
     """(1-day, 1-week) deltas from the daily price series.
 
-    Gamma's detail response only ships oneMonthPriceChange, so without this
-    the deepest call would be the one that shows no trend.
+    Taken by list index this silently mis-measures: the series can carry two
+    points for the same day, so "seven entries back" stops being "seven days
+    ago". Walk by date instead.
     """
     if len(history) < 2:
         return (None, None)
-    latest = history[-1]["p"]
-    day = round(latest - history[-2]["p"], 4)
-    week = round(latest - history[-8]["p"], 4) if len(history) >= 8 else None
+    latest = history[-1]
+    last_date = parse_iso(latest["date"])
+    if last_date is None:
+        return (None, None)
+
+    earlier = [p for p in history[:-1]
+               if (parse_iso(p["date"]) or last_date) < last_date]
+    if not earlier:
+        return (None, None)
+    day = round(latest["p"] - earlier[-1]["p"], 4)
+
+    cutoff = last_date - timedelta(days=7)
+    week_points = [p for p in earlier if (parse_iso(p["date"]) or last_date) <= cutoff]
+    week = round(latest["p"] - week_points[-1]["p"], 4) if week_points else None
     return (day, week)
+
+
+def _display_title(market):
+    """A rung has to be quotable on its own.
+
+    In search output every rung of an event shares the event's title, so
+    "What will META hit in August 2026?" plus 50.5% says nothing about
+    whether that is a rise or a fall — the direction lives only in the
+    outcome label.
+    """
+    title = str(market.get("title") or "").strip()
+    outcome = str(market.get("outcome") or "").strip()
+    if not outcome or outcome == title or outcome.lower() in ("yes", "no"):
+        return title
+    return f"{title} — {outcome}" if title else outcome
 
 
 def _poly_url(event_slug, market_slug):
@@ -378,6 +413,15 @@ def detail_polymarket(condition_id):
 # None and a silently empty report. The v1 search endpoint still carries the
 # old cent-denominated names alongside the new ones.
 
+def _usable_rules(text):
+    """Kalshi sometimes ships the rule template rather than the rule:
+    "above || Count || by || Date || at || Time ||". That cannot be verified
+    against anything, so treat it as absent rather than as text."""
+    if text and "||" in text:
+        return None
+    return text or None
+
+
 def _kalshi_url(ticker):
     series = (ticker or "").split("-")[0].lower()
     return f"https://kalshi.com/markets/{series}" if series else "https://kalshi.com"
@@ -414,11 +458,18 @@ def parse_kalshi_v2_markets(raw):
             "end_date": end,
             "end_date_passed": bool(parsed_end and parsed_end < now_utc()),
             "url": _kalshi_url(m.get("ticker")),
-            "rules": m.get("rules_primary"),
+            "rules": _usable_rules(m.get("rules_primary")),
         })
         label_outcomes(market, ["Yes", "No"],
                        [prob, (1 - prob) if prob is not None else None])
-        out.append(finalize(market))
+        finalize(market)
+        if not market["rules"]:
+            # v2 is the endpoint that carries rules; missing here means the
+            # venue shipped an unrendered template, and the workflow's
+            # resolution check cannot be performed on this market.
+            market["flags"].insert(0, "⚠️ No resolution text available — cannot "
+                                      "verify what this market resolves on")
+        out.append(market)
     return out
 
 
@@ -444,8 +495,12 @@ def parse_kalshi_search(raw):
                 "outcome": m.get("yes_subtitle") or m.get("title") or "Yes",
                 "probability": prob,
                 "prob_24h_change": round(prob - previous, 4) if (prob is not None and previous is not None) else None,
-                # v1 search reports contract counts; each contract settles at $1.
-                "volume_usd": as_float(m.get("volume")) or as_float(entry.get("total_volume")),
+                # The v1 search endpoint counts both sides of every trade:
+                # its nested `volume` is exactly twice v2's `volume_fp`, and
+                # the entry's own `total_volume` agrees with the halved
+                # figure. Contracts settle at $1, so halved contracts ≈ USD.
+                "volume_usd": (as_float(m.get("volume")) / 2 if as_float(m.get("volume"))
+                               else as_float(entry.get("total_volume"))),
                 # Venue-level, covering every sibling market — never this
                 # market's own 24h figure.
                 "event_volume_24h_usd": as_float(entry.get("recent_volume")),
@@ -466,12 +521,49 @@ def search_kalshi(keyword, limit=6):
     return parse_kalshi_search(http_json(url))[: limit * 3]
 
 
+def kalshi_history(ticker, days=30):
+    """Daily closes from Kalshi's candlestick endpoint.
+
+    `detail` promised a 30-day trend and delivered it only for Polymarket,
+    so the trend line of the answer format was unfillable for the venue with
+    the deeper book on many questions.
+    """
+    series = (ticker or "").split("-")[0]
+    if not series:
+        return []
+    end = int(now_utc().timestamp())
+    start = end - days * 86400
+    raw = http_json(f"{KALSHI}/trade-api/v2/series/{urllib.parse.quote(series)}"
+                    f"/markets/{urllib.parse.quote(ticker)}/candlesticks"
+                    f"?start_ts={start}&end_ts={end}&period_interval=1440")
+    out = []
+    for candle in raw.get("candlesticks") or []:
+        price = candle.get("price") or {}
+        value = as_float(price.get("close_dollars")) or as_float(price.get("mean_dollars"))
+        stamp_ts = candle.get("end_period_ts")
+        if value is None or not stamp_ts:
+            continue
+        out.append({"date": datetime.fromtimestamp(stamp_ts, timezone.utc).strftime("%Y-%m-%d"),
+                    "p": round(value, 4)})
+    return out
+
+
 def detail_kalshi(ticker):
     raw = http_json(f"{KALSHI}/trade-api/v2/markets/{urllib.parse.quote(ticker)}")
     markets = parse_kalshi_v2_markets({"markets": [raw.get("market", {})]})
     if not markets:
         raise LookupError(f"no active Kalshi market {ticker}")
-    return stamp(markets[0])
+    market = markets[0]
+    try:
+        market["history"] = kalshi_history(ticker)
+        day, week = changes_from_history(market["history"])
+        if market["prob_24h_change"] is None:
+            market["prob_24h_change"] = day
+        if market["prob_7d_change"] is None:
+            market["prob_7d_change"] = week
+    except Exception as exc:
+        market["history_error"] = str(exc)
+    return stamp(market)
 
 
 # --------------------------------------------------------------------------
@@ -544,7 +636,8 @@ def metaculus_available():
 
 def search_metaculus(keyword, limit=4):
     if not metaculus_available():
-        return []
+        raise RuntimeError(
+            "metaculus needs the scrapling CLI on PATH or PREDICTION_MARKET_SCRAPLING")
     binary = _scrapling_binary()
     url = f"https://www.metaculus.com/questions/?search={urllib.parse.quote(keyword)}"
     out_path = f"/tmp/pm_metaculus_{abs(hash(keyword)) % 10**8}.md"
@@ -553,8 +646,8 @@ def search_metaculus(keyword, limit=4):
                        capture_output=True, timeout=90, check=False)
         with open(out_path, encoding="utf-8") as fh:
             text = fh.read()
-    except Exception:
-        return []
+    except Exception as exc:
+        raise RuntimeError(f"metaculus scrape failed: {exc}")
     finally:
         if os.path.exists(out_path):
             os.remove(out_path)
@@ -581,6 +674,137 @@ def search_metaculus(keyword, limit=4):
         if len(out) >= limit:
             break
     return out
+
+
+TICKER_RE = re.compile(r"\(([A-Z]{1,6})\)")
+WINDOW_WORDS = {
+    "january", "february", "march", "april", "may", "june", "july", "august",
+    "september", "october", "november", "december", "week", "weekly", "month",
+    "monthly", "daily", "quarter", "eod", "tomorrow",
+}
+TOUCH_WORDS = ("at any point", "any time", "anytime", "touch", "hit", "dip", "reach")
+CLOSE_WORDS = ("closing price", "close above", "closes above", "finish", "final price")
+
+
+def _is_touch_market(market):
+    """Only "reached at any point in the window" markets nest by window
+    length. Closing above a level on the 21st and on the 31st are unrelated
+    questions, so comparing them would invent a violation."""
+    rules = str(market.get("rules") or "").lower()
+    if any(word in rules for word in CLOSE_WORDS):
+        return False
+    haystack = f"{market.get('title') or ''} {market.get('outcome') or ''} {rules}".lower()
+    return any(word in haystack for word in TOUCH_WORDS)
+
+
+def _underlying(market):
+    """What the market is about, ignoring the window it covers."""
+    title = str(market.get("event_title") or market.get("title") or "")
+    ticker = TICKER_RE.search(title)
+    if ticker:
+        return ("ticker", ticker.group(1))
+    tokens = content_tokens(title) - {stem(w) for w in WINDOW_WORDS}
+    return ("tokens", frozenset(tokens))
+
+
+def _same_underlying(a, b, minimum=3):
+    kind_a, val_a = a
+    kind_b, val_b = b
+    if kind_a != kind_b:
+        return False
+    if kind_a == "ticker":
+        return val_a == val_b
+    return len(val_a & val_b) >= minimum
+
+
+def check_windows(markets):
+    """Flag the same level priced higher over a shorter window.
+
+    A level touched during the week of 17 August is necessarily touched
+    during August, so the weekly rung can never price above the monthly one.
+    Polymarket had them at 95.5% and 87.5%. The per-event ladder check cannot
+    see this: the rungs live in different events.
+    """
+    groups = {}
+    for market in markets:
+        if market.get("probability") is None or not _is_touch_market(market):
+            continue
+        parts = _ladder_parts(market)
+        end = parse_iso(market.get("end_date"))
+        if not parts or not end:
+            continue
+        shape, value = parts
+        groups.setdefault((market.get("source"), shape, value), []).append(
+            (end, market, _underlying(market)))
+
+    for entries in groups.values():
+        if len(entries) < 2:
+            continue
+        entries.sort(key=lambda item: item[0])
+        for i, (short_end, short_m, short_u) in enumerate(entries):
+            for long_end, long_m, long_u in entries[i + 1:]:
+                if short_end >= long_end or not _same_underlying(short_u, long_u):
+                    continue
+                gap = short_m["probability"] - long_m["probability"]
+                if gap <= LADDER_TOLERANCE:
+                    continue
+                note = (f"⚠️ Window inconsistent: {short_m['probability']:.1%} by "
+                        f"{short_end.date()} but only {long_m['probability']:.1%} by "
+                        f"{long_end.date()} for the same level — the shorter window "
+                        f"cannot be likelier")
+                for market in (short_m, long_m):
+                    if note not in market["flags"]:
+                        market["flags"].append(note)
+
+
+CROSS_EVENT_DAYS = 7
+
+
+def check_cross_event_thresholds(markets):
+    """Flag the same underlying priced out of order across separate events.
+
+    One venue had "hit $170k in 2026" at 2.15% and a standalone "hit $150k by
+    31 Dec 2026" at 1.25%. Touching 170k means touching 150k on the way, so
+    that ordering cannot hold. Both the per-event ladder check and the
+    nested-window check miss it: same window, different thresholds, different
+    events.
+    """
+    entries = []
+    for market in markets:
+        if market.get("probability") is None or not _is_touch_market(market):
+            continue
+        parts = _ladder_parts(market)
+        end = parse_iso(market.get("end_date"))
+        if not parts or not end:
+            continue
+        shape, value = parts
+        direction = _expected_direction(shape, market.get("event_title") or market.get("title"))
+        if direction is None:
+            continue
+        entries.append((market, value, direction, end, _underlying(market)))
+
+    for i, (m_a, v_a, dir_a, end_a, u_a) in enumerate(entries):
+        for m_b, v_b, dir_b, end_b, u_b in entries[i + 1:]:
+            if m_a is m_b or v_a == v_b or dir_a != dir_b:
+                continue
+            if (m_a.get("event_title") or m_a.get("title")) == (m_b.get("event_title") or m_b.get("title")):
+                continue  # same event — the ladder check owns this
+            if abs((end_a - end_b).days) > CROSS_EVENT_DAYS:
+                continue
+            # One shared subject word is enough here: the pair has already
+            # had to be two touch markets, same direction, deadlines within
+            # a week, different thresholds, different events.
+            if not _same_underlying(u_a, u_b, minimum=1):
+                continue
+            low, high = (m_a, m_b) if v_a < v_b else (m_b, m_a)
+            delta = high["probability"] - low["probability"]
+            if delta * dir_a < -LADDER_TOLERANCE:
+                note = (f"⚠️ Cross-market inconsistency: {high['outcome']} prints "
+                        f"{high['probability']:.1%} but {low['outcome']} only "
+                        f"{low['probability']:.1%}, same underlying and deadline")
+                for market in (low, high):
+                    if note not in market["flags"]:
+                        market["flags"].append(note)
 
 
 # --------------------------------------------------------------------------
@@ -636,8 +860,10 @@ DETAILERS = {
 
 
 def _activity(market):
-    return (market.get("volume_24h_usd") or market.get("volume_7d_usd")
-            or market.get("volume_usd") or 0)
+    """Lifetime volume first. Ranking on 24h flow let one quiet day sink an
+    $8.4M market below a $1.25M one."""
+    return (market.get("volume_usd") or market.get("volume_7d_usd")
+            or market.get("volume_24h_usd") or market.get("event_volume_24h_usd") or 0)
 
 
 # --------------------------------------------------------------------------
@@ -676,9 +902,27 @@ STOPWORDS = {
     "move", "moves", "rise", "rises", "fall", "falls", "drop", "drops",
     # Country filler: too common in titles to discriminate.
     "us", "usa", "u", "s",
+    # Interrogatives. Every venue titles markets "Which party will…",
+    # "What will X hit…", so these match everything and identify nothing.
+    "what", "which", "who", "whom", "whose", "when", "where", "how", "why",
+    "whether",
 }
 
 TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+# Venues name the same thing two ways in the same breath: a search for
+# "Bitcoin" threw away every market titled "BTC ...". Each group collapses to
+# one canonical stem on both sides of the match.
+ALIASES = {
+    "btc": "bitcoin", "xbt": "bitcoin",
+    "eth": "ethereum", "ether": "ethereum",
+    "sol": "solana", "doge": "dogecoin", "xrp": "ripple",
+    "tsla": "tesla", "aapl": "apple", "msft": "microsoft", "nvda": "nvidia",
+    "googl": "alphabet", "goog": "alphabet", "google": "alphabet",
+    "amzn": "amazon", "meta": "meta", "fb": "meta",
+    "spx": "sp500", "sp": "sp500", "gop": "republican", "dem": "democrat",
+    "dems": "democrat", "fomc": "fed",
+}
 
 # Crude but symmetric: applied to both sides, so "impeachment" and
 # "impeached" meet at the same string even though neither is a real root.
@@ -706,7 +950,8 @@ def _content_pairs(text):
         # unrelated market clears a two-word bar.
         if token in STOPWORDS or token[0].isdigit() or len(token) < 2:
             continue
-        yield stem(token), len(token)
+        stemmed = stem(token)
+        yield ALIASES.get(stemmed, stemmed), len(token)
 
 
 def content_tokens(text):
@@ -794,8 +1039,34 @@ def _ladder_parts(market):
     value = as_float(found.group(0).replace(",", ""))
     if value is None:
         return None
-    shape = (label[: found.start()] + "#" + label[found.end():]).strip()
+    # Blank every number, not just the first, so "25,000-29,999.99" and
+    # "30,000-34,999.99" land in one group instead of two groups of one.
+    shape = LADDER_NUMBER.sub("#", label).strip()
     return shape, value
+
+
+# Which way a ladder must run. "Above $X" gets less likely as X rises;
+# "↓ $X" — touching a level on the way down — gets more likely as X rises
+# toward the current price. Reading the direction from the labels is what
+# lets a wholly inverted ladder be recognised as inverted.
+FALLING_MARKS = ("↑", "above", "over", "≥", ">", "at least", "or more", "or above", "+")
+RISING_MARKS = ("↓", "below", "under", "≤", "<", "or less", "dip")
+
+
+def _expected_direction(shape, title):
+    """-1 if probability should fall as the threshold rises, +1 if it should
+    rise, None when the rungs are not thresholds at all.
+
+    "Democrats hold exactly 46 seats" is a distribution and is supposed to
+    peak in the middle; checking it for monotonicity guarantees a false
+    warning, and the skill requires every warning to be relayed.
+    """
+    haystack = f"{shape} {title or ''}".lower()
+    if any(mark in haystack for mark in FALLING_MARKS):
+        return -1
+    if any(mark in haystack for mark in RISING_MARKS):
+        return 1
+    return None
 
 
 def check_ladders(markets):
@@ -806,31 +1077,43 @@ def check_ladders(markets):
         if not parts or market.get("probability") is None:
             continue
         shape, value = parts
-        key = (market.get("source"), market.get("event_title") or market.get("title"), shape)
-        groups.setdefault(key, []).append((value, market))
+        title = market.get("event_title") or market.get("title")
+        groups.setdefault((market.get("source"), title, shape), []).append((value, market))
 
-    for (_, _, shape), rungs in groups.items():
+    for (_, title, shape), rungs in groups.items():
+        direction = _expected_direction(shape, title)
+        if direction is None:
+            # Mutually exclusive buckets: not monotone, but they must add up.
+            # A ladder returned in part looks exactly like a complete one.
+            total = sum(m["probability"] for _, m in rungs)
+            if len(rungs) >= 4 and total < 0.97:
+                note = (f"⚠️ Distribution incomplete: the {len(rungs)} buckets returned "
+                        f"sum to {total:.0%} — some outcomes are missing")
+                for _, market in rungs:
+                    if note not in market["flags"]:
+                        market["flags"].append(note)
+            continue
         if len(rungs) < LADDER_MIN_RUNGS:
             continue
         rungs.sort(key=lambda pair: pair[0])
-        ups = downs = 0
-        worst = None
-        for (lo_v, lo_m), (hi_v, hi_m) in zip(rungs, rungs[1:]):
+        # Every step running against the ladder's own direction is broken.
+        # Reporting only the largest one hid the inversion that happened to
+        # sit on the question being asked.
+        offenders = []
+        for (_, lo_m), (_, hi_m) in zip(rungs, rungs[1:]):
             delta = hi_m["probability"] - lo_m["probability"]
-            if delta > LADDER_TOLERANCE:
-                ups += 1
-                if worst is None or delta > worst[0]:
-                    worst = (delta, lo_m, hi_m)
-            elif delta < -LADDER_TOLERANCE:
-                downs += 1
-        if ups and downs and worst:
-            _, lo_m, hi_m = worst
-            note = (f"⚠️ Ladder inconsistent: {hi_m['outcome']} prints "
-                    f"{hi_m['probability']:.1%} while {lo_m['outcome']} prints "
-                    f"{lo_m['probability']:.1%} — some rungs are unquoted stubs")
-            for _, market in rungs:
-                if note not in market["flags"]:
-                    market["flags"].append(note)
+            if delta * direction < -LADDER_TOLERANCE:
+                offenders.append((lo_m, hi_m))
+        if not offenders:
+            continue
+        detail = "; ".join(
+            f"{hi_m['outcome']} {hi_m['probability']:.1%} vs {lo_m['outcome']} "
+            f"{lo_m['probability']:.1%}" for lo_m, hi_m in offenders[:4])
+        note = (f"⚠️ Ladder inconsistent ({len(offenders)}): {detail} "
+                f"— some rungs are unquoted stubs")
+        for _, market in rungs:
+            if note not in market["flags"]:
+                market["flags"].append(note)
 
 
 def drop_unpriced(markets):
@@ -855,11 +1138,86 @@ def build_search_payload(keywords, sources, errors, markets):
     }
     if errors:
         payload["unavailable"] = errors
-    if not markets:
+    if markets:
+        payload["verdict"] = "found"
+    elif errors and all(source in errors for source in sources):
+        # Every venue asked failed or was not installed. Reporting
+        # "no market" here would turn a broken run into a confident answer.
+        payload["verdict"] = "sources_unavailable"
+        payload["note"] = ("No venue could be queried, so nothing is known. "
+                           "This is not evidence that no market exists.")
+    else:
         payload["verdict"] = "no_live_market"
+    if not markets and payload["verdict"] == "no_live_market":
         payload["note"] = ("No live market covers this question. Say so plainly; "
                            "do not substitute an estimate of your own.")
     return payload
+
+
+NUMBER_WITH_SUFFIX = re.compile(r"(\d[\d,]*(?:\.\d+)?)\s*([kmb])?", re.I)
+SUFFIX_SCALE = {"k": 1_000, "m": 1_000_000, "b": 1_000_000_000}
+
+
+def keyword_numbers(keywords):
+    """Amounts the asker named, so their rung survives the per-event cap.
+
+    A 32-rung Bitcoin ladder was capped at 20 by volume and the rung it
+    dropped was 150,000 — in a search whose keyword group was "Bitcoin 150k".
+    """
+    found = set()
+    for keyword in keywords:
+        for digits, suffix in NUMBER_WITH_SUFFIX.findall(keyword or ""):
+            value = as_float(digits.replace(",", ""))
+            if value is not None:
+                found.add(value * SUFFIX_SCALE.get((suffix or "").lower(), 1))
+    return found
+
+
+def order_rungs(markets):
+    """Keep an event's rungs together and in threshold order.
+
+    Ranking alone interleaves ↑ and ↓ rungs of one ladder by volume, so the
+    caller has to reassemble the ladder by parsing arrows out of the labels
+    before it can read the distribution — the shape that answers "how far".
+    """
+    order, grouped = [], {}
+    for market in markets:
+        key = _event_key(market)
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(market)
+
+    out = []
+    for key in order:
+        rungs = grouped[key]
+        parts = [(_ladder_parts(m), m) for m in rungs]
+        if all(p for p, _ in parts) and len(rungs) > 2:
+            rungs = [m for _, m in sorted(parts, key=lambda item: (item[0][0], item[0][1]))]
+        out.extend(rungs)
+    return out
+
+
+SHORT_HORIZON_DAYS = 2
+LONG_HORIZON_DAYS = 14
+
+
+def _horizon_tier(market, pool):
+    """Demote markets expiring within days, but only when longer-dated
+    candidates exist. A next-day "BTC above X at 8pm" event outranked every
+    rung of the year-end ladder; when the question really is about today,
+    nothing here changes."""
+    end = parse_iso(market.get("end_date"))
+    if not end:
+        return 0
+    now = now_utc()
+    if (end - now).days > SHORT_HORIZON_DAYS:
+        return 0
+    for other in pool:
+        other_end = parse_iso(other.get("end_date"))
+        if other_end and (other_end - now).days > LONG_HORIZON_DAYS:
+            return 1
+    return 0
 
 
 def rank_key(market):
@@ -875,7 +1233,7 @@ def _event_key(market):
 MAX_RUNGS_PER_EVENT = 20
 
 
-def run_search(keywords, sources, limit, show_dropped=False):
+def run_search(keywords, sources, limit=8, show_dropped=False):
     jobs, results, errors = [], [], {}
     with ThreadPoolExecutor(max_workers=8) as pool:
         for source in sources:
@@ -911,16 +1269,26 @@ def run_search(keywords, sources, limit, show_dropped=False):
             order.append(key)
         grouped[key].append(market)
 
-    per_source, trimmed = {}, []
+    wanted_numbers = keyword_numbers(keywords)
+    per_source, trimmed, skipped = {}, [], []
     for key in order:
         source = key[0]
         if per_source.get(source, 0) >= limit:
+            skipped.append(key)
             continue
         per_source[source] = per_source.get(source, 0) + 1
-        trimmed.extend(grouped[key][:MAX_RUNGS_PER_EVENT])
+        rungs = grouped[key]
+        if len(rungs) > MAX_RUNGS_PER_EVENT and wanted_numbers:
+            asked = [m for m in rungs
+                     if (_ladder_parts(m) or (None, None))[1] in wanted_numbers]
+            rungs = asked + [m for m in rungs if m not in asked]
+        trimmed.extend(rungs[:MAX_RUNGS_PER_EVENT])
 
     check_ladders(trimmed)
-    trimmed.sort(key=rank_key)
+    check_windows(trimmed)
+    check_cross_event_thresholds(trimmed)
+    trimmed.sort(key=lambda m: (_horizon_tier(m, trimmed),) + rank_key(m))
+    trimmed = order_rungs(trimmed)
 
     payload = build_search_payload(keywords, sources, errors, trimmed)
     payload["events"] = [
@@ -928,11 +1296,21 @@ def run_search(keywords, sources, limit, show_dropped=False):
             "source": key[0],
             "title": key[1],
             "outcomes_returned": len(grouped[key][:MAX_RUNGS_PER_EVENT]),
-            "outcomes_total": len(grouped[key]),
+            # What this search matched, NOT the venue's outcome count — the
+            # same event can match 18 rungs on one query and 3 on another,
+            # so this cannot prove a ladder came back whole.
+            "outcomes_matched": len(grouped[key]),
             "url": grouped[key][0].get("url"),
         }
         for key in order if any(m in trimmed for m in grouped[key])
     ]
+    if skipped:
+        # Silent truncation reads as "this is everything there is".
+        payload["events_not_returned"] = [
+            {"source": key[0], "title": key[1], "outcomes": len(grouped[key])}
+            for key in skipped]
+        payload["limit_note"] = (f"--limit {limit} events per venue; {len(skipped)} more "
+                                 f"matched and were not returned. Raise --limit to see them.")
     if dropped:
         payload["dropped_as_irrelevant"] = len(dropped)
         if show_dropped:
@@ -942,6 +1320,32 @@ def run_search(keywords, sources, limit, show_dropped=False):
                 for m in dropped[:25]
             ]
     return payload
+
+
+COMPARE_SLOP_PP = 5.0
+
+
+def compare_summary(markets):
+    """The spread the output template asks for, computed rather than left to
+    the reader — plus the caveats that make a spread meaningless."""
+    probs = [m["probability"] for m in markets if m.get("probability") is not None]
+    summary = {"spread_pp": None, "agree": None, "caveats": []}
+    if len(probs) >= 2:
+        spread = (max(probs) - min(probs)) * 100
+        summary["spread_pp"] = round(spread, 1)
+        summary["agree"] = spread <= COMPARE_SLOP_PP
+    ends = [parse_iso(m.get("end_date")) for m in markets]
+    ends = [e for e in ends if e]
+    if len(ends) >= 2 and (max(ends) - min(ends)).days > CROSS_EVENT_DAYS:
+        summary["caveats"].append(
+            f"Deadlines differ by {(max(ends) - min(ends)).days} days "
+            f"({min(ends).date()} vs {max(ends).date()}) — these may not be the same question")
+    missing = [m.get("source") for m in markets if not m.get("rules")]
+    if missing:
+        summary["caveats"].append(
+            f"No resolution text from {', '.join(sorted(set(missing)))} — "
+            f"cannot confirm both sides resolve on the same event")
+    return summary
 
 
 def run_compare(refs):
@@ -958,6 +1362,9 @@ def run_compare(refs):
             errors[ref] = f"{type(exc).__name__}: {exc}"
     payload = {"fetched_at": now_utc().isoformat(timespec="seconds"), "markets": markets}
     check_ladders(markets)
+    check_windows(markets)
+    check_cross_event_thresholds(markets)
+    payload.update(compare_summary(markets))
     note = divergence_note(markets)
     if note:
         payload["divergence"] = note
@@ -974,7 +1381,7 @@ def main(argv=None):
     p_search = sub.add_parser("search", help="search every venue for live markets")
     p_search.add_argument("keywords", nargs="+", help="English keyword groups")
     p_search.add_argument("--sources", default="polymarket,kalshi,manifold")
-    p_search.add_argument("--limit", type=int, default=4, help="events kept per venue")
+    p_search.add_argument("--limit", type=int, default=8, help="events kept per venue")
     p_search.add_argument("--show-dropped", action="store_true",
                           help="list what the relevance gate rejected")
 

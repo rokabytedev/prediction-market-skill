@@ -163,5 +163,32 @@ class DetailControls(unittest.TestCase):
                          f"bogus depth warning: {market['flags']}")
 
 
+class KalshiTrendControls(unittest.TestCase):
+    """`detail` promised a 30-day trend and delivered it only for Polymarket,
+    leaving the answer format's trend line unfillable for the venue that
+    often has the deeper book."""
+
+    def test_kalshi_detail_now_carries_history(self):
+        payload = pm_query.run_search(["Fed decision"], ["kalshi"], limit=2)
+        self.assertTrue(payload["candidates"])
+        market = pm_query.detail_kalshi(payload["candidates"][0]["id"])
+        self.assertGreater(len(market.get("history") or []), 5,
+                           f"no Kalshi history: {market.get('history_error')}")
+        self.assertIsNotNone(market["prob_24h_change"])
+
+
+class CompareControls(unittest.TestCase):
+    def test_compare_computes_the_spread_it_is_asked_for(self):
+        poly = pm_query.run_search(["US recession 2026"], ["polymarket"], limit=1)
+        kalshi = pm_query.run_search(["recession this year"], ["kalshi"], limit=1)
+        self.assertTrue(poly["candidates"] and kalshi["candidates"])
+        payload = pm_query.run_compare([
+            f"polymarket:{poly['candidates'][0]['id']}",
+            f"kalshi:{kalshi['candidates'][0]['id']}"])
+        self.assertIn("spread_pp", payload)
+        self.assertIsNotNone(payload["spread_pp"])
+        self.assertIn("agree", payload)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

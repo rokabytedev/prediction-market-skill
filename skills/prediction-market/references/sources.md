@@ -150,6 +150,31 @@ or the bid/ask sizes.
 
 Contracts settle at $1, so contract counts and dollars are interchangeable.
 
+### v1 search volume counts both sides
+
+The nested `volume` on a v1 search result is exactly twice the v2
+`volume_fp` for the same market, and the entry's own `total_volume` agrees
+with the halved figure — the search endpoint reports both sides of each
+trade. Since credibility thresholds key on volume, taking it at face value
+makes the same market look twice as deep in search as in detail.
+
+### Rules can arrive as an unrendered template
+
+`rules_primary` sometimes comes back as `"If the price is above || Count ||
+by || Date || at || Time ||"`. It parses fine and means nothing. Treat any
+rules text containing `||` as absent.
+
+### Price history lives on a series-scoped path
+
+```
+GET /trade-api/v2/series/{series}/markets/{ticker}/candlesticks
+    ?start_ts=…&end_ts=…&period_interval=1440
+```
+
+The market-scoped spelling (`/markets/{ticker}/candlesticks`) 404s. `series`
+is the ticker up to the first hyphen. Closes are in `price.close_dollars`,
+with `price.mean_dollars` as a fallback on days with no close.
+
 ### Venue-level volume is not market-level volume
 
 Search results carry `recent_volume` on the *event*. Attributing it to each

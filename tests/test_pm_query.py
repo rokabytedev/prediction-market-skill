@@ -166,7 +166,7 @@ class CredibilityTest(unittest.TestCase):
 
     def test_near_certain_price_noted(self):
         flags = pm_query.credibility_flags(self.base(probability=0.99))
-        self.assertTrue(any("settled" in f for f in flags))
+        self.assertTrue(any("near certain" in f for f in flags))
 
 
 class HoldersTest(unittest.TestCase):
@@ -702,3 +702,361 @@ class SingleWordLeakTest(unittest.TestCase):
         second match that lets an unrelated market through."""
         for token in ("150k", "2026", "25bps"):
             self.assertNotIn(token, pm_query.content_tokens(f"price {token}"))
+
+
+class NestedWindowTest(unittest.TestCase):
+    """The week of 17 August sits inside August, so a level touched during
+    the week is necessarily touched during the month. Polymarket priced
+    "touch $540 this week" at 95.5% and "touch $540 in August" at 87.5% —
+    an eight-point arbitrage violation that the per-event ladder check
+    cannot see, because the two rungs live in different events.
+    """
+
+    def markets(self):
+        raw = load("poly_search_nested_windows.json")
+        out = []
+        for event in raw["events"]:
+            out.extend(pm_query.parse_polymarket_event(event))
+        return out
+
+    def test_shorter_window_pricing_above_longer_is_flagged(self):
+        markets = self.markets()
+        pm_query.check_windows(markets)
+        flagged = [m for m in markets if any("window" in f.lower() for f in m["flags"])]
+        self.assertTrue(flagged, "nested-window violation should be called out")
+        self.assertTrue(any("540" in str(m["outcome"]) for m in flagged),
+                        f"expected the $540 rungs: {[m['outcome'] for m in flagged]}")
+
+    def test_consistent_nested_windows_are_silent(self):
+        markets = self.markets()
+        pm_query.check_windows(markets)
+        consistent = [m for m in markets
+                      if "460" in str(m["outcome"]) or "700" in str(m["outcome"])]
+        self.assertTrue(consistent)
+        for m in consistent:
+            self.assertFalse([f for f in m["flags"] if "window" in f.lower()],
+                             f"false alarm on {m['outcome']}")
+
+    def test_different_underlyings_are_never_compared(self):
+        """A Tesla ladder and a Meta ladder can both have a $520 rung."""
+        def rung(title, end, p):
+            m = pm_query.blank_market("polymarket")
+            m.update({"id": title + end, "title": title, "event_title": title,
+                      "outcome": "↓ $520", "probability": p, "end_date": end,
+                      "rules": "resolves if the price is reached at any point"})
+            return m
+        markets = [rung("What will Tesla, Inc. (TSLA) hit Week of August 17?", "2026-08-21T00:00:00Z", 0.95),
+                   rung("What will Meta Platforms, Inc. (META) hit in August 2026?", "2026-09-01T00:00:00Z", 0.80)]
+        pm_query.check_windows(markets)
+        self.assertEqual([f for m in markets for f in m["flags"] if "window" in f.lower()], [])
+
+    def test_close_style_ladders_are_not_compared_across_windows(self):
+        """Closing above a level on the 21st and on the 31st are unrelated
+        questions — neither nests inside the other."""
+        def rung(title, end, p):
+            m = pm_query.blank_market("polymarket")
+            m.update({"id": title + end, "title": title, "event_title": title,
+                      "outcome": "$540", "probability": p, "end_date": end,
+                      "rules": "resolves to Yes if the closing price is above the level"})
+            return m
+        markets = [rung("Will Meta (META) finish week of August 17 above___?", "2026-08-21T00:00:00Z", 0.9),
+                   rung("Will Meta (META) close above ___ end of August?", "2026-09-01T00:00:00Z", 0.6)]
+        pm_query.check_windows(markets)
+        self.assertEqual([f for m in markets for f in m["flags"] if "window" in f.lower()], [])
+
+
+class MissingRulesTest(unittest.TestCase):
+    """Step 3 of the workflow is "read the resolution criteria". Manifold
+    returns none at all, so the verification the skill leans on cannot be
+    performed and the output has to say so."""
+
+    def test_market_without_resolution_text_is_flagged(self):
+        markets = pm_query.parse_manifold_search(load("manifold_search.json"))
+        for m in markets:
+            if not m.get("rules"):
+                self.assertTrue(any("resolution text" in f.lower() for f in m["flags"]),
+                                f"unflagged unverifiable market: {m['title']}")
+
+
+class DisplayTitleTest(unittest.TestCase):
+    """In search output every rung of an event shares one title — "What will
+    META hit in August 2026?" — and the direction lives only in `outcome`.
+    Quoting title plus probability publishes a number with no idea whether it
+    means up or down."""
+
+    def test_rungs_carry_a_self_describing_title(self):
+        markets = pm_query.parse_polymarket_event(load("poly_event_touch_ladder.json"))
+        down = next(m for m in markets if str(m["outcome"]).startswith("↓"))
+        self.assertIn(str(down["outcome"]), down["display_title"])
+        self.assertIn("META", down["display_title"])
+
+
+class SearchContractTest(unittest.TestCase):
+    def test_success_has_an_explicit_verdict(self):
+        payload = pm_query.build_search_payload(
+            keywords=["x"], sources=["polymarket"], errors={},
+            markets=[{"source": "polymarket", "id": "a", "probability": 0.5}])
+        self.assertEqual(payload["verdict"], "found")
+
+    def test_empty_result_keeps_the_no_market_verdict(self):
+        payload = pm_query.build_search_payload(
+            keywords=["x"], sources=["polymarket"], errors={}, markets=[])
+        self.assertEqual(payload["verdict"], "no_live_market")
+
+
+# ==========================================================================
+# Second regression round: defects found testing the midterms and Bitcoin
+# questions (2026-08-18).
+# ==========================================================================
+
+
+class SourceSelectionTest(unittest.TestCase):
+    """SKILL.md said "opt in with --sources metaculus". Because --sources
+    replaces the list rather than adding to it, that documented action
+    queried only Metaculus, found it uninstalled, and returned
+    no_live_market — on a question backed by multi-million-dollar markets.
+    A documented action must never manufacture a false negative."""
+
+    def test_a_source_that_could_not_run_is_not_reported_as_no_market(self):
+        payload = pm_query.build_search_payload(
+            keywords=["senate"], sources=["metaculus"],
+            errors={"metaculus": "unavailable: scrapling not installed"}, markets=[])
+        self.assertNotEqual(payload["verdict"], "no_live_market")
+        self.assertEqual(payload["verdict"], "sources_unavailable")
+
+    def test_empty_result_from_working_sources_is_still_no_market(self):
+        payload = pm_query.build_search_payload(
+            keywords=["x"], sources=["polymarket", "kalshi"], errors={}, markets=[])
+        self.assertEqual(payload["verdict"], "no_live_market")
+
+    def test_metaculus_reports_itself_unavailable_rather_than_empty(self):
+        if pm_query.metaculus_available():
+            self.skipTest("scrapling is installed here")
+        with self.assertRaises(RuntimeError):
+            pm_query.search_metaculus("anything")
+
+
+class KalshiVolumeDenominationTest(unittest.TestCase):
+    """The v1 search endpoint reports both sides of every trade: its nested
+    `volume` is exactly twice the v2 `volume_fp` for the same market, and the
+    entry's own `total_volume` agrees with the halved figure. Since the
+    thin-market threshold keys on this field, one subcommand can call a
+    market noise while the other calls it credible."""
+
+    def test_search_volume_matches_the_venue_total(self):
+        raw = load("kalshi_search.json")
+        entry = raw["current_page"][0]
+        nested = float(entry["markets"][0]["volume"])
+        total = float(entry["total_volume"])
+        self.assertAlmostEqual(nested / 2, total, delta=1.0,
+                               msg="fixture should still show the doubling")
+        parsed = next(m for m in pm_query.parse_kalshi_search(raw)
+                      if m["id"] == entry["markets"][0]["ticker"])
+        self.assertAlmostEqual(parsed["volume_usd"], total, delta=1.0)
+
+
+class ExactCountLadderTest(unittest.TestCase):
+    """"Democrats hold exactly 45 / 46 / 47 seats" is a distribution and is
+    supposed to be hump-shaped. Flagging it as inconsistent produces a
+    guaranteed false warning, and the skill requires every warning to be
+    relayed to the user."""
+
+    def rungs(self, shape_title, labels_and_probs):
+        return [{"source": "kalshi", "title": shape_title, "event_title": shape_title,
+                 "outcome": label, "probability": p, "flags": []}
+                for label, p in labels_and_probs]
+
+    def test_seat_distribution_is_not_called_inconsistent(self):
+        markets = self.rungs("How many Senate seats will Democrats hold?",
+                             [("45", 0.019), ("46", 0.031), ("47", 0.068),
+                              ("48", 0.11), ("49", 0.13), ("50", 0.15), ("51", 0.16)])
+        pm_query.check_ladders(markets)
+        self.assertEqual([f for m in markets for f in m["flags"]
+                          if "inconsistent" in f.lower()], [])
+
+    def test_a_complete_distribution_is_silent(self):
+        markets = self.rungs("How many Senate seats will Democrats hold?",
+                             [("48", 0.25), ("49", 0.25), ("50", 0.25), ("51", 0.26)])
+        pm_query.check_ladders(markets)
+        self.assertEqual([f for m in markets for f in m["flags"]], [])
+
+    def test_a_partial_distribution_says_so(self):
+        """Buckets that sum to two thirds look exactly like a complete set."""
+        markets = self.rungs("How many Senate seats will Democrats hold?",
+                             [("45", 0.019), ("46", 0.031), ("47", 0.068), ("48", 0.11)])
+        pm_query.check_ladders(markets)
+        self.assertTrue([f for m in markets for f in m["flags"] if "incomplete" in f.lower()])
+
+    def test_threshold_ladder_without_arrows_is_still_checked(self):
+        """"close above ___" rungs are bare dollar labels but are thresholds."""
+        markets = self.rungs("Will Meta (META) close above ___ end of August?",
+                             [("$440", 0.8995), ("$460", 0.924), ("$480", 0.8995)])
+        pm_query.check_ladders(markets)
+        self.assertTrue([f for m in markets for f in m["flags"]])
+
+
+class AllInversionsTest(unittest.TestCase):
+    """The Kalshi Bitcoin ladder had two inversions of identical size. Only
+    the first was named, and the one that went unnamed — P(>150k) above
+    P(>140k) — was the rung the question was about."""
+
+    def ladder(self, pairs):
+        return [{"source": "kalshi", "title": "Highest Bitcoin price this year?",
+                 "event_title": "Highest Bitcoin price this year?",
+                 "outcome": f"Above ${v}", "probability": p, "flags": []}
+                for v, p in pairs]
+
+    def test_every_inversion_is_named(self):
+        markets = self.ladder([(99999, 0.11), (109999, 0.06), (119999, 0.07),
+                               (129999, 0.06), (139999, 0.03), (149999, 0.04)])
+        pm_query.check_ladders(markets)
+        note = " ".join(markets[0]["flags"])
+        self.assertIn("119999", note)
+        self.assertIn("149999", note)
+
+    def test_a_wholly_inverted_ladder_is_flagged(self):
+        """Requiring both an up-step and a down-step let a ladder that only
+        ever rises pass unchallenged."""
+        markets = self.ladder([(100000, 0.02), (150000, 0.05), (200000, 0.09)])
+        pm_query.check_ladders(markets)
+        self.assertTrue([f for m in markets for f in m["flags"]])
+
+
+class KalshiTemplateRulesTest(unittest.TestCase):
+    """One Kalshi market returned its rules as an unrendered template —
+    "above || Count || by || Date || at || Time ||" — which makes the
+    resolution check the workflow depends on impossible."""
+
+    def test_unrendered_template_is_treated_as_missing(self):
+        raw = {"markets": [{"ticker": "X", "title": "t", "status": "active",
+                            "last_price_dollars": "0.03", "volume_fp": "100000",
+                            "rules_primary": "If the price is above || Count || by "
+                                             "|| Date || at || Time ||, then Yes."}]}
+        market = pm_query.parse_kalshi_v2_markets(raw)[0]
+        self.assertIsNone(market["rules"])
+        self.assertTrue(any("resolution text" in f.lower() for f in market["flags"]))
+
+
+class HistoryByDateTest(unittest.TestCase):
+    """Deltas were taken by list index, but the series can carry two points
+    for the same day, which silently shifts what "seven days ago" means."""
+
+    def test_duplicate_days_do_not_shift_the_window(self):
+        history = [{"date": "2026-08-11", "p": 0.40}, {"date": "2026-08-12", "p": 0.41},
+                   {"date": "2026-08-13", "p": 0.42}, {"date": "2026-08-14", "p": 0.43},
+                   {"date": "2026-08-15", "p": 0.44}, {"date": "2026-08-16", "p": 0.45},
+                   {"date": "2026-08-17", "p": 0.46}, {"date": "2026-08-18", "p": 0.14},
+                   {"date": "2026-08-18", "p": 0.50}]
+        day, week = pm_query.changes_from_history(history)
+        self.assertAlmostEqual(week, 0.10, places=4)   # 0.50 vs 08-11's 0.40
+        self.assertAlmostEqual(day, 0.04, places=4)    # 0.50 vs 08-17's 0.46
+
+
+class QueryNumberRungTest(unittest.TestCase):
+    """A 32-rung ladder was capped at 20 by volume, and the rung dropped was
+    the 150,000 one — in a search whose keyword group was "Bitcoin 150k"."""
+
+    def test_numbers_in_the_question_are_recognised(self):
+        self.assertEqual(pm_query.keyword_numbers(["Bitcoin 150k", "BTC"]), {150000.0})
+        self.assertEqual(pm_query.keyword_numbers(["META 520"]), {520.0})
+        self.assertIn(1500000.0, pm_query.keyword_numbers(["1.5m market cap"]))
+
+
+class CrossEventThresholdTest(unittest.TestCase):
+    """On one venue, "hit $170k in 2026" printed 2.15% while the standalone
+    "hit $150k by Dec 31 2026" printed 1.25%. Touching 170k means touching
+    150k first, so that ordering is impossible — and the two rungs live in
+    different events, where the per-event check cannot see them."""
+
+    def touch(self, title, outcome, p, end="2026-12-31T00:00:00Z"):
+        m = pm_query.blank_market("polymarket")
+        m.update({"id": outcome + title, "title": title, "event_title": title,
+                  "outcome": outcome, "probability": p, "end_date": end,
+                  "rules": "resolves Yes if the price is reached at any point"})
+        return m
+
+    def test_same_underlying_and_deadline_must_stay_ordered(self):
+        markets = [self.touch("What price will Bitcoin hit in 2026?", "↑ $170,000", 0.0215),
+                   self.touch("Will Bitcoin hit $150k by December 31, 2026?", "↑ $150,000", 0.0125)]
+        pm_query.check_cross_event_thresholds(markets)
+        self.assertTrue([f for m in markets for f in m["flags"] if "cross-market" in f.lower()])
+
+    def test_consistent_pair_is_silent(self):
+        markets = [self.touch("What price will Bitcoin hit in 2026?", "↑ $170,000", 0.01),
+                   self.touch("Will Bitcoin hit $150k by December 31, 2026?", "↑ $150,000", 0.03)]
+        pm_query.check_cross_event_thresholds(markets)
+        self.assertEqual([f for m in markets for f in m["flags"] if "cross-market" in f.lower()], [])
+
+    def test_different_deadlines_are_not_compared(self):
+        markets = [self.touch("What price will Bitcoin hit in 2026?", "↑ $170,000", 0.0215,
+                              end="2026-12-31T00:00:00Z"),
+                   self.touch("Will Bitcoin hit $150k by March 2026?", "↑ $150,000", 0.0125,
+                              end="2026-03-31T00:00:00Z")]
+        pm_query.check_cross_event_thresholds(markets)
+        self.assertEqual([f for m in markets for f in m["flags"] if "cross-market" in f.lower()], [])
+
+
+class TickerAliasTest(unittest.TestCase):
+    """Searching "Bitcoin" threw away every market titled "BTC ...", and on a
+    thinner coin that gap is the difference between an answer and a wrongly
+    confident "no market"."""
+
+    def market(self, title):
+        return {"source": "polymarket", "id": title, "title": title,
+                "outcome": "Yes", "probability": 0.5}
+
+    def test_bitcoin_matches_btc_titles(self):
+        kept = pm_query.filter_relevant(
+            [self.market("Will BTC hit $50,000 before $100,000?")], ["Bitcoin"])
+        self.assertEqual(len(kept), 1)
+
+    def test_btc_matches_bitcoin_titles(self):
+        kept = pm_query.filter_relevant(
+            [self.market("Will Bitcoin close above 100k this year?")], ["BTC price"])
+        self.assertEqual(len(kept), 1)
+
+    def test_aliases_do_not_collapse_different_coins(self):
+        kept = pm_query.filter_relevant(
+            [self.market("Will Ethereum close above 5000?")], ["Bitcoin"])
+        self.assertEqual(kept, [])
+
+
+class CompareOutputTest(unittest.TestCase):
+    """`compare` returned two detail payloads and nothing else, while the
+    output template demands a cross-check line — so the comparison the
+    subcommand exists for stayed with the model."""
+
+    def test_reports_the_spread_and_whether_they_agree(self):
+        summary = pm_query.compare_summary([
+            {"source": "polymarket", "probability": 0.515, "end_date": "2026-11-03T00:00:00Z"},
+            {"source": "kalshi", "probability": 0.49, "end_date": "2026-11-03T00:00:00Z"},
+        ])
+        self.assertAlmostEqual(summary["spread_pp"], 2.5, places=1)
+        self.assertTrue(summary["agree"])
+
+    def test_flags_a_wide_gap(self):
+        summary = pm_query.compare_summary([
+            {"source": "polymarket", "probability": 0.73, "end_date": None},
+            {"source": "kalshi", "probability": 0.62, "end_date": None},
+        ])
+        self.assertFalse(summary["agree"])
+
+    def test_warns_when_the_deadlines_differ(self):
+        summary = pm_query.compare_summary([
+            {"source": "polymarket", "probability": 0.515, "end_date": "2026-11-03T00:00:00Z"},
+            {"source": "kalshi", "probability": 0.49, "end_date": "2027-02-01T00:00:00Z"},
+        ])
+        self.assertTrue([c for c in summary["caveats"] if "deadline" in c.lower()])
+
+
+class LongShotWordingTest(unittest.TestCase):
+    """"Market treats this as all but settled" fired on every tail rung of an
+    18-rung ladder. Relaying that verbatim tells the reader their market is
+    over, which is false — it is a long shot, not a settled question."""
+
+    def test_tail_price_is_called_a_long_shot(self):
+        flags = pm_query.credibility_flags(
+            {"source": "polymarket", "probability": 0.011, "volume_usd": 3_000_000.0,
+             "volume_24h_usd": 25_000.0, "liquidity_usd": 200_000.0})
+        self.assertTrue(any("long shot" in f.lower() for f in flags))
+        self.assertFalse(any("settled" in f.lower() for f in flags))
