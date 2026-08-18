@@ -122,8 +122,8 @@ different thresholds. A rung reading 52 percent is meaningless until you know
 where the price is now, so run `spot TICKER` first and lead with it.
 
 **Check the `name` the quote came back with.** Bare crypto tickers resolve to
-equities on the data source — `BTC` is an ETF trading near $28, not Bitcoin
-near $65,000 — so the script maps known coins to their pair form and says so
+equities on the data source — `BTC` is an ETF trading near 28 USD, not Bitcoin
+near 65,000 USD — so the script maps known coins to their pair form and says so
 in `note`. For anything it does not know, `name` and `instrument_type` are
 there to be read: a ladder about a coin anchored to something labelled ETF is
 the wrong anchor.
@@ -152,7 +152,7 @@ is about:
   contains it.
 - **Same level priced twice** — one venue quoting the same level and deadline
   two different ways, e.g. a ladder rung at 2.5% beside a standalone market at
-  1.2%. At least one is wrong; report the range, not one of the numbers.
+  1.2% for the identical level. At least one is wrong; report the range, not one of the numbers.
 - **Distribution incomplete / incoherent** — mutually exclusive outcomes that
   sum to well under 100% (some are missing) or above it (the quotes contradict
   each other). This fires on any field of alternatives, prices and names alike.
