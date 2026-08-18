@@ -6,6 +6,7 @@ so these tests fail if a provider changes its schema out from under us.
 
 import json
 import os
+import re
 import sys
 import unittest
 
@@ -1308,3 +1309,31 @@ class DateIsNotALevelTest(unittest.TestCase):
         pm_query.check_cross_event_thresholds(markets)
         self.assertTrue([f for m in markets for f in m["flags"] if "cross-market" in f.lower()],
                         "touching 200k cannot be likelier than touching 150k")
+
+
+class SkillDocLintTest(unittest.TestCase):
+    """SKILL.md is executable in a way prose usually is not: the loader
+    substitutes $1..$9 with the invocation's arguments, so a literal dollar
+    amount in the text arrives mangled. This has now been introduced twice —
+    once in the worked example, once in the paragraph warning about ticker
+    resolution — so it gets a test."""
+
+    def doc(self):
+        path = os.path.join(HERE, "..", "skills", "prediction-market", "SKILL.md")
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_no_dollar_digit_sequences(self):
+        offenders = [line.strip() for line in self.doc().splitlines()
+                     if re.search(r"\$\d", line)]
+        self.assertEqual(offenders, [], "write amounts as '1.7M USD', not with a $ prefix")
+
+    def test_frontmatter_declares_name_and_description(self):
+        head = self.doc().split("---")[1]
+        self.assertIn("name: prediction-market", head)
+        self.assertIn("description:", head)
+
+    def test_every_referenced_file_exists(self):
+        base = os.path.join(HERE, "..", "skills", "prediction-market")
+        for rel in re.findall(r"`(scripts/[\w./-]+|references/[\w./-]+)`", self.doc()):
+            self.assertTrue(os.path.exists(os.path.join(base, rel)), f"missing {rel}")
