@@ -91,6 +91,8 @@ def blank_market(source):
         "volume_24h_usd": None,
         "volume_7d_usd": None,
         "event_id": None,
+        "exclusive": None,
+        "event_outcomes_on_venue": None,
         "event_volume_24h_usd": None,
         "liquidity_usd": None,
         "open_interest_usd": None,
@@ -98,6 +100,7 @@ def blank_market(source):
         "participants_label": None,
         "participants_truncated": False,
         "end_date": None,
+        "start_date": None,
         "end_date_passed": False,
         "url": None,
         "rules": None,
@@ -129,6 +132,19 @@ def label_outcomes(market, labels, prices):
     market["outcome_prices"] = pairs
     market["probability_of"] = pairs[0]["label"] if pairs else None
     return market
+
+
+def _end_date_is_broken(market):
+    """Polymarket recycles events and the child can inherit the parent's old
+    end date. One market titled "by December 31, 2026" carried endDate
+    2025-12-31 — it opened six months after its own supposed expiry and
+    traded today. Reporting that as expiry is worse than saying nothing.
+    """
+    end = parse_iso(market.get("end_date"))
+    start = parse_iso(market.get("start_date"))
+    if end and start and start > end:
+        return True
+    return bool(market.get("volume_24h_usd"))
 
 
 def credibility_flags(market):
@@ -172,7 +188,7 @@ def credibility_flags(market):
     if not recent:
         flags.append("⚠️ No recent trading — the price may be stale")
 
-    if market.get("end_date_passed"):
+    if market.get("end_date_passed") and not _end_date_is_broken(market):
         flags.append(f"⚠️ End date already passed ({str(market.get('end_date'))[:10]}) "
                      f"— this may be awaiting settlement, not a live view")
 
@@ -261,11 +277,17 @@ def parse_polymarket_event(event):
             "volume_7d_usd": as_float(raw.get("volume1wk")),
             "liquidity_usd": as_float(raw.get("liquidityNum")) or as_float(raw.get("liquidity")),
             "end_date": end,
+            "start_date": raw.get("startDate") or event.get("startDate"),
             "end_date_passed": bool(parsed_end and parsed_end < now_utc()),
             "url": _poly_url(event_slug, raw.get("slug")),
             "rules": raw.get("description") or event.get("description"),
             "event_title": event.get("title"),
             "event_id": str(event.get("id") or event.get("slug") or event.get("title") or ""),
+            # negRisk is Polymarket's own statement that the event is
+            # single-winner. Guessing exclusivity from titles produced a false
+            # alarm on every shape that is not: nested deadlines, removal
+            # boards, "what will the deal contain".
+            "exclusive": bool(event.get("negRisk") or event.get("enableNegRisk")),
             "clob_token_id": (json.loads(raw["clobTokenIds"])[0]
                               if isinstance(raw.get("clobTokenIds"), str) and raw["clobTokenIds"]
                               else None),
@@ -442,10 +464,17 @@ def parse_kalshi_v2_markets(raw):
         if m.get("status") not in (None, "active", "initialized"):
             continue
         prob = as_float(m.get("last_price_dollars"))
+        bid, ask = as_float(m.get("yes_bid_dollars")), as_float(m.get("yes_ask_dollars"))
+        stale_print = False
         if prob is None:
-            bid, ask = as_float(m.get("yes_bid_dollars")), as_float(m.get("yes_ask_dollars"))
             if bid is not None and ask is not None:
                 prob = (bid + ask) / 2
+        elif bid is not None and ask is not None and ask > bid:
+            # A last trade outside the live book is a stale print, not a
+            # price: one rung read 96% against a book of 0.00 / 0.30.
+            if not (bid - LADDER_TOLERANCE <= prob <= ask + LADDER_TOLERANCE):
+                prob = (bid + ask) / 2
+                stale_print = True
         previous = as_float(m.get("previous_price_dollars"))
         end = m.get("close_time")
         parsed_end = parse_iso(end)
@@ -474,6 +503,9 @@ def parse_kalshi_v2_markets(raw):
         label_outcomes(market, ["Yes", "No"],
                        [prob, (1 - prob) if prob is not None else None])
         finalize(market)
+        if stale_print:
+            market["flags"].insert(0, "⚠️ Last trade sits outside the current book — "
+                                      "using the bid/ask midpoint instead")
         if not market["rules"]:
             # v2 is the endpoint that carries rules; missing here means the
             # venue shipped an unrendered template, and the workflow's
@@ -518,6 +550,11 @@ def parse_kalshi_search(raw):
                 "participants_label": "open interest (Kalshi publishes no trader count)",
                 "end_date": end,
                 "event_id": entry.get("event_ticker") or entry.get("series_ticker"),
+                # The venue states how many markets the event has, so a search
+                # that returns nine of eighteen can say so instead of looking
+                # complete.
+                "event_outcomes_on_venue": (entry.get("active_market_count")
+                                            or entry.get("total_market_count")),
                 "url": _kalshi_url(entry.get("series_ticker") or ticker),
             })
             market["display_title"] = _display_title(market)
@@ -1281,12 +1318,35 @@ def drop_stubs(markets):
     probability, those stubs print above the real 23% favourite. A market
     nobody has traded, still at the seeded coin flip, holds no view at all.
     """
+    def traded(market):
+        return (market.get("volume_usd") or market.get("volume_24h_usd")
+                or market.get("volume_7d_usd") or market.get("volume_mana"))
+
+    # A seed is not always 0.5: one field sat untouched at 42.5-43% across
+    # seven rows, summing to 300%. Untraded rows sharing one price are the
+    # venue's placeholder, whatever that price happens to be.
+    SEED_BAND = 0.02
+    per_event = {}
+    for market in markets:
+        if traded(market) or market.get("probability") is None:
+            continue
+        per_event.setdefault(_event_key(market), []).append(market)
+
+    seeded = set()
+    for rows in per_event.values():
+        rows.sort(key=lambda m: m["probability"])
+        start = 0
+        for end in range(len(rows)):
+            while rows[end]["probability"] - rows[start]["probability"] > SEED_BAND:
+                start += 1
+            if end - start + 1 >= 3:
+                seeded.update(id(m) for m in rows[start:end + 1])
+
     kept = []
     for market in markets:
-        traded = (market.get("volume_usd") or market.get("volume_24h_usd")
-                  or market.get("volume_7d_usd") or market.get("volume_mana"))
-        if not traded and market.get("probability") == STUB_PRICE:
-            continue
+        if not traded(market):
+            if market.get("probability") == STUB_PRICE or id(market) in seeded:
+                continue
         kept.append(market)
     return kept
 
@@ -1352,36 +1412,9 @@ DISTRIBUTION_MIN = 0.97
 # A complete futures board runs a few points over 100% on the spread alone,
 # so the ceiling has to sit above ordinary margin.
 DISTRIBUTION_MAX = 1.12
-# Past this, whatever the field is, it is not one-winner.
-DISTRIBUTION_CEILING = 1.5
-
 # Fields where several outcomes win at once: sixteen teams make the playoffs,
 # so thirty "will they make it" markets are supposed to sum near 1600%.
-# "seats" is deliberately absent: "How many seats will they hold?" is a
-# proper distribution over mutually exclusive counts, not a multi-winner field.
-MULTI_WINNER_MARKS = ("playoff", "qualify", "advance", "make the", "reach the",
-                      "nominat", "shortlist", "top 4", "top four", "medal",
-                      "relegat", "promot")
 
-
-CUMULATIVE_TITLE_MARKS = ("when will", "how soon", "when does", "when is")
-CUMULATIVE_LABEL_MARKS = ("before ", "by ", "on or before")
-
-
-def _is_cumulative_field(title, rungs):
-    """Nested deadlines rather than alternatives.
-
-    "When will Bitcoin cross $100k again?" lists before-September,
-    before-October, before-January — each window contains the last, so the
-    prices are supposed to climb and their sum means nothing. Treating them
-    as a distribution reported "78% sits on outcomes not shown" about a field
-    that was complete.
-    """
-    if any(mark in (title or "").lower() for mark in CUMULATIVE_TITLE_MARKS):
-        return True
-    labelled = sum(1 for m in rungs
-                   if str(m.get("outcome") or "").lower().startswith(CUMULATIVE_LABEL_MARKS))
-    return labelled * 2 >= len(rungs)
 
 
 def check_distribution(markets):
@@ -1405,27 +1438,23 @@ def check_distribution(markets):
     for rungs in groups.values():
         if len(rungs) < 4:
             continue
-        parts = [_ladder_parts(m) for m in rungs]
-        title = (rungs[0].get("event_title") or rungs[0].get("title") or "")
-        if any(p and _expected_direction(p[0], title) for p in parts):
-            continue  # thresholds, not alternatives
-        if any(mark in title.lower() for mark in MULTI_WINNER_MARKS):
-            continue  # several outcomes win at once; the sum means nothing
-        if _is_cumulative_field(title, rungs):
-            continue  # nested deadlines, each containing the last
+        # Only the venue knows whether its outcomes are alternatives.
+        # Polymarket says so with negRisk, Kalshi with mutually_exclusive; a
+        # field that does not say is left alone, because silence beats a
+        # warning that a healthy market is broken.
+        if not all(m.get("exclusive") for m in rungs):
+            continue
         total = sum(m["probability"] for m in rungs)
-        if total >= DISTRIBUTION_CEILING:
-            continue  # not a one-winner board, whatever it is
         note = None
         if total < DISTRIBUTION_MIN:
             note = (f"⚠️ Distribution incomplete: the {len(rungs)} outcomes returned sum "
                     f"to {total:.0%}, so {1 - total:.0%} of the probability sits on "
                     f"outcomes the venue did not return — do not read these as the "
-                    f"whole field, and do not expect another page to reveal them")
+                    f"whole field")
         elif total > DISTRIBUTION_MAX:
-            note = (f"⚠️ Distribution incoherent: {len(rungs)} outcomes sum to {total:.0%} "
-                    f"— either the quotes contradict each other or these outcomes are "
-                    f"not actually mutually exclusive")
+            note = (f"⚠️ Distribution incoherent: {len(rungs)} outcomes the venue calls "
+                    f"mutually exclusive sum to {total:.0%} — these quotes contradict "
+                    f"each other")
         if not note:
             continue
         for market in rungs:
@@ -1502,6 +1531,44 @@ def _event_key(market):
 MAX_RUNGS_PER_EVENT = 20
 
 
+def annotate_events(payload, markets, max_outcomes=MAX_RUNGS_PER_EVENT,
+                    grouped=None, order=None):
+    """The per-event index: what came back, what it sums to, and whether it
+    is all there."""
+    if grouped is None:
+        grouped, order = {}, []
+        for market in markets:
+            key = _event_key(market)
+            if key not in grouped:
+                grouped[key] = []
+                order.append(key)
+            grouped[key].append(market)
+
+    events = []
+    for key in order:
+        rows = grouped[key]
+        if not any(m in markets for m in rows):
+            continue
+        returned = rows[:max_outcomes]
+        on_venue = next((m.get("event_outcomes_on_venue") for m in rows
+                         if m.get("event_outcomes_on_venue")), None)
+        events.append({
+            "source": key[0],
+            "title": rows[0].get("event_title") or rows[0].get("title"),
+            "outcomes_returned": len(returned),
+            "outcomes_matched": len(rows),
+            "outcomes_on_venue": on_venue,
+            "outcomes_sum": round(sum(m["probability"] for m in returned
+                                      if m.get("probability") is not None), 4),
+            "exclusive": rows[0].get("exclusive"),
+            "possibly_truncated": (len(rows) > max_outcomes
+                                   or bool(on_venue and on_venue > len(rows))),
+            "url": rows[0].get("url"),
+        })
+    payload["events"] = events
+    return payload
+
+
 def run_search(keywords, sources, limit=8, show_dropped=False,
                max_outcomes=MAX_RUNGS_PER_EVENT):
     jobs, results, errors = [], [], {}
@@ -1563,25 +1630,7 @@ def run_search(keywords, sources, limit=8, show_dropped=False,
     trimmed = order_rungs(trimmed)
 
     payload = build_search_payload(keywords, sources, errors, trimmed)
-    payload["events"] = [
-        {
-            "source": key[0],
-            "title": (grouped[key][0].get("event_title")
-                      or grouped[key][0].get("title")),
-            "outcomes_returned": len(grouped[key][:max_outcomes]),
-            # What this search matched, NOT the venue's outcome count — the
-            # same event can match 18 rungs on one query and 3 on another,
-            # so this cannot prove a ladder came back whole.
-            "outcomes_matched": len(grouped[key]),
-            # Sum what was returned, so this and the distribution flag speak
-            # about the same set of rows.
-            "outcomes_sum": round(sum(m["probability"] for m in grouped[key][:max_outcomes]
-                                      if m.get("probability") is not None), 4),
-            "possibly_truncated": len(grouped[key]) > max_outcomes,
-            "url": grouped[key][0].get("url"),
-        }
-        for key in order if any(m in trimmed for m in grouped[key])
-    ]
+    annotate_events(payload, trimmed, max_outcomes, grouped, order)
     if skipped:
         # Silent truncation reads as "this is everything there is".
         payload["events_not_returned"] = [

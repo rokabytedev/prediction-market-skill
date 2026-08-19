@@ -154,9 +154,14 @@ is about:
 - **Same level priced twice** — one venue quoting the same level and deadline
   two different ways, e.g. a ladder rung at 2.5% beside a standalone market at
   1.2% for the identical level. At least one is wrong; report the range, not one of the numbers.
-- **Distribution incomplete / incoherent** — mutually exclusive outcomes that
-  sum to well under 100% (some are missing) or above it (the quotes contradict
-  each other). This fires on any field of alternatives, prices and names alike.
+- **Distribution incomplete / incoherent** — outcomes **the venue itself
+  declares mutually exclusive** that sum to well under 100% (some are missing)
+  or above it (the quotes contradict each other). Exclusivity is read from
+  Polymarket's `negRisk` and Kalshi's `mutually_exclusive`, never guessed: a
+  board of nested deadlines, a "which country gets removed" field and a
+  playoff-berth field all sum past or under 100% while being perfectly
+  healthy. A field the venue does not declare exclusive is left unchecked,
+  and `exclusive` in the events index says which is which.
 - **End date already passed** — the market is past its date and may be awaiting
   settlement rather than showing a live view.
 
@@ -208,8 +213,11 @@ Rules for that block:
   Ladders are different — show the rungs in order, per step 5.
 - A price under 2% is flagged "priced as a long shot", not settled. On a ladder
   tail that is ordinary, so report it as the market's view of a remote outcome.
-- `possibly_truncated` on an event means it filled the per-event cap, so there
-  are probably more outcomes than you can see. Raise `--limit` or say so.
+- `possibly_truncated` means outcomes are missing — either the per-event cap
+  bound, or the venue returned fewer than the event holds (`outcomes_on_venue`
+  against `outcomes_returned`). Raise `--max-outcomes`, and when the venue is
+  the one holding back, say the field is partial rather than presenting it as
+  complete.
 - Manifold is play money and Metaculus is not a market — label both, and never
   lead with them when a real-money venue has the same question.
 - Give the market link on its own line, plain text.

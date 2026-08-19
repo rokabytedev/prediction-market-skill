@@ -864,7 +864,8 @@ class ExactCountLadderTest(unittest.TestCase):
 
     def rungs(self, shape_title, labels_and_probs):
         return [{"source": "kalshi", "title": shape_title, "event_title": shape_title,
-                 "outcome": label, "probability": p, "flags": []}
+                 "event_id": shape_title, "outcome": label, "probability": p,
+                 "exclusive": True, "flags": []}
                 for label, p in labels_and_probs]
 
     def test_seat_distribution_is_not_called_inconsistent(self):
@@ -1134,7 +1135,8 @@ class DistributionSumTest(unittest.TestCase):
             m = pm_query.blank_market(source)
             m.update({"id": f"c{i}", "title": "Nobel Peace Prize Winner 2026",
                       "event_title": "Nobel Peace Prize Winner 2026",
-                      "outcome": f"Candidate {chr(65 + i)}", "probability": p})
+                      "outcome": f"Candidate {chr(65 + i)}", "probability": p,
+                      "exclusive": True})
             out.append(m)
         return out
 
@@ -1357,7 +1359,10 @@ class MultiWinnerFieldTest(unittest.TestCase):
             m = pm_query.blank_market("polymarket")
             m.update({"id": f"{title}{i}", "title": title, "event_title": title,
                       "event_id": title, "outcome": f"Team {chr(65 + i)}",
-                      "probability": p, "volume_usd": 10_000.0})
+                      "probability": p, "volume_usd": 10_000.0,
+                      # Only single-winner boards carry the venue's
+                      # exclusivity flag; playoff and qualifying boards do not.
+                      "exclusive": "Champion" in title or "win the" in title})
             out.append(m)
         return out
 
@@ -1431,7 +1436,8 @@ class CumulativeFieldTest(unittest.TestCase):
 
     def windows(self, title, labels_and_probs):
         return [{"source": "kalshi", "title": title, "event_title": title,
-                 "event_id": title, "outcome": label, "probability": p, "flags": []}
+                 "event_id": title, "outcome": label, "probability": p,
+                 "exclusive": "win the" in title, "flags": []}
                 for label, p in labels_and_probs]
 
     def test_nested_windows_are_not_summed(self):
@@ -1556,3 +1562,185 @@ class DeadlineProximityTest(unittest.TestCase):
                               0.001, "2026-09-01T03:59:00Z")]
         pm_query.check_cross_event_thresholds(markets)
         self.assertTrue([f for m in markets for f in m["flags"]])
+
+
+# ==========================================================================
+# Seventh round: the pre-publication audit. Every defect sits in the warning
+# layer, where a false alarm reaches the reader as fact (2026-08-18).
+# ==========================================================================
+
+
+class PolymarketCumulativeTest(unittest.TestCase):
+    """Polymarket's cumulative format puts "by" in the title and bare dates in
+    the rungs: "US-Iran Final Nuclear Deal by…?" with rows August 18, August
+    31 … December 31. A deal by August is also a deal by December, so the six
+    rows are nested windows. Summing them to 27% and announcing that 73% of
+    the probability is hidden describes a complete, millions-in-volume field
+    as broken."""
+
+    def series(self, title, rows):
+        return [{"source": "polymarket", "title": title, "event_title": title,
+                 "event_id": title, "outcome": label, "probability": p,
+                 "exclusive": "Nobel" in title, "flags": []}
+                for label, p in rows]
+
+    def test_bare_date_rungs_rising_in_date_order_are_nested(self):
+        markets = self.series("US-Iran Final Nuclear Deal by…?",
+                              [("August 18", 0.0005), ("August 31", 0.0075),
+                               ("September 30", 0.0255), ("October 31", 0.045),
+                               ("November 30", 0.08), ("December 31", 0.115)])
+        pm_query.check_distribution(markets)
+        self.assertEqual([f for m in markets for f in m["flags"]], [])
+
+    def test_a_named_field_is_still_checked(self):
+        markets = self.series("Nobel Peace Prize Winner 2026",
+                              [("Navalnaya", 0.085), ("Zelenskyy", 0.054),
+                               ("UNRWA", 0.0425), ("Trump", 0.0245)])
+        pm_query.check_distribution(markets)
+        self.assertTrue([f for m in markets for f in m["flags"]])
+
+
+class IndependentBinaryFieldTest(unittest.TestCase):
+    """Every row of "Country To Be Removed as Host of 2030 World Cup?"
+    resolves on its own country, with no clause making them exclusive — FIFA
+    dropping three co-hosts resolves three rows Yes. Summing them to 123% and
+    calling the quotes contradictory is the playoff mistake in another
+    costume."""
+
+    def test_a_removal_field_is_not_called_incoherent(self):
+        markets = [{"source": "polymarket", "title": "Country To Be Removed as Host of 2030 World Cup?",
+                    "event_title": "Country To Be Removed as Host of 2030 World Cup?",
+                    "event_id": "removal", "outcome": name, "probability": p, "flags": []}
+                   for name, p in [("Portugal", 0.255), ("Argentina", 0.255),
+                                   ("Uruguay", 0.251), ("Morocco", 0.2175),
+                                   ("Paraguay", 0.1525), ("Spain", 0.1025)]]
+        pm_query.check_distribution(markets)
+        self.assertEqual([f for m in markets for f in m["flags"]], [])
+
+
+class BrokenEndDateTest(unittest.TestCase):
+    """A live market titled "by December 31, 2026" carried endDate 2025-12-31,
+    inherited from a recycled parent event — it opened six months after its
+    own supposed expiry and traded today. Three contradictions sit in the
+    payload already."""
+
+    def market(self, **kw):
+        m = pm_query.blank_market("polymarket")
+        m.update({"id": "x", "title": "Will Russia invade a NATO country by December 31, 2026?",
+                  "outcome": "December 31, 2026", "probability": 0.055,
+                  "end_date": "2025-12-31T00:00:00Z", "end_date_passed": True,
+                  "start_date": "2026-06-30T00:00:00Z", "volume_usd": 500_000.0,
+                  "volume_24h_usd": 261.0, "liquidity_usd": 50_000.0})
+        m.update(kw)
+        return m
+
+    def test_an_end_date_before_the_start_date_is_not_an_expiry(self):
+        flags = pm_query.credibility_flags(self.market())
+        self.assertFalse([f for f in flags if "End date already passed" in f])
+
+    def test_recent_trading_contradicts_expiry(self):
+        flags = pm_query.credibility_flags(self.market(start_date=None))
+        self.assertFalse([f for f in flags if "End date already passed" in f])
+
+    def test_a_genuinely_expired_market_is_still_flagged(self):
+        flags = pm_query.credibility_flags(
+            self.market(start_date="2025-01-01T00:00:00Z", volume_24h_usd=0.0,
+                        volume_7d_usd=0.0, event_volume_24h_usd=0.0))
+        self.assertTrue([f for f in flags if "End date already passed" in f])
+
+
+class KalshiBookSanityTest(unittest.TestCase):
+    """A Kalshi rung printed 96% on a last trade while the live book stood at
+    bid 0.00 / ask 0.30 — a stale print roughly six times the true value,
+    handed over as the market's view."""
+
+    def test_a_last_trade_outside_the_book_is_replaced_by_the_mid(self):
+        raw = {"markets": [{"ticker": "T", "title": "t", "status": "active",
+                            "last_price_dollars": "0.96", "yes_bid_dollars": "0.00",
+                            "yes_ask_dollars": "0.30", "volume_fp": "100000",
+                            "rules_primary": "resolves on the CPI print"}]}
+        market = pm_query.parse_kalshi_v2_markets(raw)[0]
+        self.assertAlmostEqual(market["probability"], 0.15, places=3)
+        self.assertTrue([f for f in market["flags"] if "outside the current book" in f])
+
+    def test_a_last_trade_inside_the_book_is_kept(self):
+        raw = {"markets": [{"ticker": "T", "title": "t", "status": "active",
+                            "last_price_dollars": "0.71", "yes_bid_dollars": "0.69",
+                            "yes_ask_dollars": "0.72", "volume_fp": "100000",
+                            "rules_primary": "resolves on the Fed decision"}]}
+        market = pm_query.parse_kalshi_v2_markets(raw)[0]
+        self.assertAlmostEqual(market["probability"], 0.71, places=3)
+
+
+class SeededRowTest(unittest.TestCase):
+    """Seven broadcast-rights rows all sat at 42.5–43% with no volume and $18
+    resting — the untouched seed — summing to 300%. They cleared the stub
+    filter because the seed was not exactly 0.5."""
+
+    def row(self, name, p):
+        m = pm_query.blank_market("polymarket")
+        m.update({"id": name, "title": "Which company gets the rights?",
+                  "event_title": "Which company gets the rights?", "event_id": "rights",
+                  "outcome": name, "probability": p, "volume_usd": None})
+        return m
+
+    def test_an_untraded_block_at_one_price_is_dropped(self):
+        markets = [self.row(n, p) for n, p in
+                   [("Fox", 0.425), ("NBC", 0.43), ("Disney", 0.425),
+                    ("Netflix", 0.43), ("Amazon", 0.425)]]
+        self.assertEqual(pm_query.drop_stubs(markets), [])
+
+    def test_a_traded_field_at_similar_prices_survives(self):
+        markets = [self.row(n, p) for n, p in
+                   [("Fox", 0.425), ("NBC", 0.43), ("Disney", 0.425)]]
+        for m in markets:
+            m["volume_usd"] = 25_000.0
+        self.assertEqual(len(pm_query.drop_stubs(markets)), 3)
+
+
+class MixedLabelExemptionTest(unittest.TestCase):
+    """One "4.5%+" row let a whole inflation field skip the distribution
+    check, hiding that the modal bucket was missing and the rest summed to
+    74%."""
+
+    def test_a_single_threshold_label_does_not_exempt_a_bucket_field(self):
+        rows = [("1.5-1.9%", 0.05), ("2.0-2.4%", 0.12), ("2.5-2.9%", 0.2345),
+                ("3.5-3.9%", 0.18), ("4.0-4.4%", 0.10), ("4.5%+", 0.06)]
+        markets = [{"source": "polymarket", "title": "U.K. Annual Inflation 2026",
+                    "event_title": "U.K. Annual Inflation 2026", "event_id": "uk",
+                    "outcome": label, "probability": p, "exclusive": True, "flags": []}
+                   for label, p in rows]
+        pm_query.check_distribution(markets)
+        self.assertTrue([f for m in markets for f in m["flags"] if "incomplete" in f.lower()])
+
+
+class VenueTruncationTest(unittest.TestCase):
+    """Kalshi's search returned 9 of an 18-rung delivery ladder and 18 of an
+    82-team World Cup field, and `possibly_truncated` said False because the
+    script's own cap never bound. The entry states how many markets the event
+    has; the subset was being presented as the whole."""
+
+    def test_kalshi_search_carries_the_venue_outcome_count(self):
+        raw = load("kalshi_search.json")
+        entry = next(e for e in raw["current_page"]
+                     if e.get("type") == "contract" and e.get("markets"))
+        markets = pm_query.parse_kalshi_search(raw)
+        mine = [m for m in markets if m["event_id"] == entry.get("event_ticker")]
+        self.assertTrue(mine)
+        expected = entry.get("active_market_count") or entry.get("total_market_count")
+        if expected:
+            self.assertEqual(mine[0]["event_outcomes_on_venue"], expected)
+
+    def test_truncation_is_reported_when_the_venue_held_some_back(self):
+        markets = []
+        for i in range(3):
+            m = pm_query.blank_market("kalshi")
+            m.update({"id": f"t{i}", "title": "Ladder", "event_title": "Ladder",
+                      "event_id": "L", "outcome": f"Above {i}", "probability": 0.5,
+                      "event_outcomes_on_venue": 18})
+            markets.append(m)
+        payload = pm_query.build_search_payload(["x"], ["kalshi"], {}, markets)
+        pm_query.annotate_events(payload, markets, max_outcomes=20)
+        event = payload["events"][0]
+        self.assertTrue(event["possibly_truncated"])
+        self.assertEqual(event["outcomes_on_venue"], 18)

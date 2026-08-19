@@ -182,6 +182,18 @@ covered by a test:
 - **Venue search is fuzzy and always returns something.** "Will I get promoted
   next year" matched the Los Angeles mayoral race; "will my cat learn to play
   piano" matched Super Bowl halftime performers.
+- **Bare crypto tickers resolve to equities.** `BTC` on the quote source is an
+  ETF near 28 USD, not Bitcoin near 65,000 — enough to make a price ladder
+  unreadable without anything looking wrong.
+- **Recycled events inherit stale dates.** A market titled "by December 31,
+  2026" carried an end date of 2025-12-31 and opened six months after its own
+  supposed expiry, while trading normally.
+- **A last trade can sit outside the live book.** One rung printed 96% against
+  a book of 0.00 / 0.30.
+- **Whether outcomes are alternatives is not guessable from the title.** Nested
+  deadlines, removal boards and playoff-berth fields all sum far from 100%
+  while being perfectly healthy, so exclusivity is read from the venue's own
+  declaration rather than inferred.
 
 `skills/prediction-market/references/sources.md` documents all of it, endpoint by
 endpoint.
@@ -189,18 +201,24 @@ endpoint.
 ## Tests
 
 ```bash
-make test         # 56 unit tests, offline, ~0.02s
-make test-live    # 9 end-to-end tests against the live APIs
+make test         # 165 unit tests, offline, ~0.03s
+make test-live    # 19 end-to-end tests against the live APIs
 ```
 
 Unit tests run against **captured real API responses**, so an upstream schema
 change breaks a test instead of quietly producing a wrong answer.
 
-The live suite's negative controls are the important ones: questions no venue
-lists ("will I get promoted next year") must come back empty. The first
-implementation failed that check, which is why it is now permanent — along with
-a guard that fails if the venues stop returning fuzzy matches at all, so the
-controls can never pass vacuously.
+The live suite runs both directions. Negative controls: questions no venue
+lists ("will I get promoted next year") must come back empty — the first
+implementation failed that, which is why it is permanent, along with a guard
+that fails if the venues stop returning fuzzy matches at all, so the controls
+cannot pass vacuously. Recall controls: common subjects (Meta, Tesla, Bitcoin,
+Fed) must never be reported as having no market — a later implementation failed
+*that*, reporting no_live_market while ten Meta events were trading.
+
+A skill that answers "how likely is X?" is only worth having if it declines
+when it should, and finds the market when there is one. Both halves are tested
+because both halves have failed.
 
 ## Layout
 
