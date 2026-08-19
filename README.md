@@ -102,7 +102,8 @@ python3 scripts/pm_query.py detail polymarket 0xfdc73f10...
 python3 scripts/pm_query.py detail kalshi KXRECSSNBER-26
 python3 scripts/pm_query.py compare kalshi:KXRECSSNBER-26 polymarket:0xfdc73f10...
 
-python3 scripts/pm_query.py search "..." --sources polymarket,kalshi --limit 6
+python3 scripts/pm_query.py spot TSLA          # anchor a price ladder
+python3 scripts/pm_query.py search "..." --limit 8 --max-outcomes 40 --show-dropped
 ```
 
 Python 3.9+, standard library only. No pip install, no API keys, no accounts.
@@ -125,7 +126,8 @@ them on a shared question is itself a signal.
 
 Metaculus is off by default: its API went login-only in 2026, so it needs the
 [`scrapling`](https://github.com/D4Vinci/Scrapling) CLI and takes about 40
-seconds. Opt in with `--sources metaculus`.
+seconds. `--sources` **replaces** the default list, so opt in with the full one:
+`--sources polymarket,kalshi,manifold,metaculus`.
 
 ## How it decides whether a number is trustworthy
 
@@ -136,10 +138,12 @@ Thresholds are in the code, not left to the model's judgement:
 | Lifetime volume < $50k | ⚠️ Thin market — this number is noise |
 | Resting orders < $5k | ⚠️ Shallow book — one sizeable order moves the price |
 | No trades recently | ⚠️ No recent trading — the price may be stale |
-| Price below 2% or above 98% | Market treats this as all but settled |
+| Price below 2% or above 98% | Priced as a long shot / near certain |
 | Source is Manifold | ⚠️ Play-money market — indicative only |
 | Source is Metaculus | Not a market — forecaster consensus |
-| Real-money venues differ by >5pt | Flagged for a closer look |
+| Real-money venues differ by >5pt, or one price is 1.5x the other | Flagged for a closer look |
+| Ladder rungs out of order, or one level priced twice | ⚠️ Named, with the offending rungs |
+| A field the venue calls mutually exclusive that does not sum to 100% | ⚠️ Incomplete or incoherent |
 
 Settled markets are dropped entirely rather than flagged — their final price of
 0 or 1 is indistinguishable from a live probability, and that mistake is silent.
